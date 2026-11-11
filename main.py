@@ -2,28 +2,34 @@ import os
 import logging
 import threading
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import requests
 import firebase_admin
 from firebase_admin import credentials, messaging
 from flask import Flask, jsonify, request
 
-# ================= CONFIG =================
+# ================ CONFIG ================
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-ADMIN_ID = str(os.getenv("TELEGRAM_ADMIN_ID", ""))
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")
 FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL", "")
-FIREBASE_PRIVATE_KEY = os.getenv("FIREBASE_PRIVATE_KEY", "").replace("\\n", "\n")
+FIREBASE_PRIVATE_KEY = os.getenv(
+    "FIREBASE_PRIVATE_KEY", ""
+).replace("\\n", "\n")
 
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TELEGRAM_API = (
+    f"https://api.telegram.org/bot{BOT_TOKEN}"
+    if BOT_TOKEN else ""
+)
 SUPABASE_TABLE = f"{SUPABASE_URL}/rest/v1/notifications"
 
 logging.basicConfig(
@@ -33,25 +39,88 @@ logging.basicConfig(
 
 app = Flask(__name__)
 
+# Simple process-local state.
 user_states = {}
 drafts = {}
-
-# Prevent concurrent processing of duplicate update IDs.
 processed_updates = set()
 processed_lock = threading.Lock()
+state_lock = threading.Lock()
 
-# ================= FIREBASE =================
+# ================ TELEGRAM API ================
+
+def telegram(method, data=None):
+    if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+
+    try:
+        response = requests.post(
+            f"{TELEGRAM_API}/{method}",
+            json=data or {},
+            timeout=30
+        )
+    except requests.RequestException:
+        logging.exception("Telegram connection failed")
+        raise
+
+    try:
+        result = response.json()
+    except ValueError:
+        logging.error(
+            "Telegram returned HTTP %s: %s",
+            response.status_code,
+            response.text[:1000]
+        )
+        response.raise_for_status()
+        raise RuntimeError("Telegram returned invalid JSON")
+
+    if not response.ok or not result.get("ok"):
+        # Do not log the bot token or full request URL.
+        code = result.get("error_code", response.status_code)
+        description = result.get("description", "Unknown Telegram error")
+        logging.error(
+            "Telegram API %s failed: %s: %s",
+            method, code, description
+        )
+        raise RuntimeError(
+            f"Telegram {method} failed ({code}): {description}"
+        )
+
+    return result
+
+
+def send_message(chat_id, text, keyboard=None):
+    data = {"chat_id": chat_id, "text": str(text)}
+    if keyboard:
+        data["reply_markup"] = keyboard
+    return telegram("sendMessage", data)
+
+
+def answer_callback(callback_id, text=""):
+    try:
+        telegram("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": text
+        })
+    except Exception:
+        logging.exception("Callback answer failed")
+
+
+# ================ FIREBASE FCM ================
 
 def init_firebase():
     if firebase_admin._apps:
         return
 
-    if not all([
+    required = [
         FIREBASE_PROJECT_ID,
         FIREBASE_CLIENT_EMAIL,
         FIREBASE_PRIVATE_KEY
-    ]):
-        raise RuntimeError("Firebase environment variables are missing")
+    ]
+    if not all(required):
+        raise RuntimeError(
+            "Missing FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL "
+            "or FIREBASE_PRIVATE_KEY"
+        )
 
     service_account = {
         "type": "service_account",
@@ -66,21 +135,20 @@ def init_firebase():
     )
 
 
-def send_fcm_notification(title, message):
+def send_fcm_notification(title, body):
     init_firebase()
 
-    notification = messaging.Message(
+    message = messaging.Message(
         notification=messaging.Notification(
             title=title,
-            body=message
+            body=body
         ),
         topic="all"
     )
+    return messaging.send(message)
 
-    return messaging.send(notification)
 
-
-# ================= SUPABASE =================
+# ================ SUPABASE ================
 
 def supabase_headers():
     return {
@@ -106,9 +174,9 @@ def supabase_request(method, params=None, data=None):
 
     if not response.ok:
         logging.error(
-            "Supabase error %s: %s",
+            "Supabase HTTP %s: %s",
             response.status_code,
-            response.text
+            response.text[:1500]
         )
         response.raise_for_status()
 
@@ -118,24 +186,22 @@ def supabase_request(method, params=None, data=None):
     return []
 
 
-def save_notification(title, message, status="sending"):
-    result = supabase_request(
+def save_notification(title, body, status="sending"):
+    rows = supabase_request(
         "POST",
         data={
             "title": title,
-            "message": message,
+            "message": body,
             "status": status
         }
     )
-
-    if not result:
-        raise RuntimeError("Supabase did not return inserted record")
-
-    return result[0]
+    if not rows:
+        raise RuntimeError("Supabase did not return the saved record")
+    return rows[0]
 
 
-def update_notification(notification_id, data):
-    payload = dict(data)
+def update_notification(notification_id, values):
+    payload = dict(values)
     payload["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     return supabase_request(
@@ -156,6 +222,18 @@ def get_notifications(limit=10):
     )
 
 
+def get_notification(notification_id):
+    rows = supabase_request(
+        "GET",
+        params={
+            "id": f"eq.{notification_id}",
+            "select": "*",
+            "limit": 1
+        }
+    )
+    return rows[0] if rows else None
+
+
 def delete_notification(notification_id):
     return supabase_request(
         "DELETE",
@@ -163,45 +241,7 @@ def delete_notification(notification_id):
     )
 
 
-# ================= TELEGRAM =================
-
-def telegram(method, data=None):
-    response = requests.post(
-        f"{TELEGRAM_API}/{method}",
-        json=data or {},
-        timeout=35
-    )
-    response.raise_for_status()
-
-    result = response.json()
-
-    if not result.get("ok"):
-        logging.error("Telegram API error: %s", result)
-
-    return result
-
-
-def send_message(chat_id, text, keyboard=None):
-    data = {
-        "chat_id": chat_id,
-        "text": text
-    }
-
-    if keyboard:
-        data["reply_markup"] = keyboard
-
-    return telegram("sendMessage", data)
-
-
-def answer_callback(callback_id, text=""):
-    try:
-        telegram("answerCallbackQuery", {
-            "callback_query_id": callback_id,
-            "text": text
-        })
-    except Exception:
-        logging.exception("Callback answer failed")
-
+# ================ ACCESS CONTROL ================
 
 def is_admin(update):
     user = None
@@ -223,7 +263,7 @@ def main_keyboard():
         "inline_keyboard": [
             [
                 {"text": "📊 Dashboard", "callback_data": "dashboard"},
-                {"text": "➕ Create Notification", "callback_data": "create"}
+                {"text": "➕ Create", "callback_data": "create"}
             ],
             [
                 {"text": "📚 History", "callback_data": "history"},
@@ -236,31 +276,42 @@ def main_keyboard():
 def show_dashboard(chat_id):
     try:
         records = get_notifications(100)
-        sent = sum(1 for x in records if x.get("status") == "sent")
-        failed = sum(1 for x in records if x.get("status") == "failed")
+        sent = sum(
+            1 for item in records if item.get("status") == "sent"
+        )
+        failed = sum(
+            1 for item in records if item.get("status") == "failed"
+        )
+        pending = sum(
+            1 for item in records if item.get("status") == "sending"
+        )
 
         text = (
             "📊 NOTIFICATION DASHBOARD\n\n"
-            f"📦 Total (latest 100): {len(records)}\n"
+            f"📦 Latest records: {len(records)}\n"
             f"✅ Sent: {sent}\n"
-            f"❌ Failed: {failed}\n\n"
+            f"❌ Failed: {failed}\n"
+            f"⏳ Sending: {pending}\n\n"
             "Select an action below."
         )
     except Exception:
-        logging.exception("Dashboard error")
-        text = "⚠️ Could not load Supabase dashboard."
+        logging.exception("Dashboard failed")
+        text = "⚠️ Could not load dashboard. Check Render Logs."
 
     send_message(chat_id, text, main_keyboard())
 
 
-# ================= CREATE NOTIFICATION =================
+# ================ CREATE NOTIFICATION ================
 
 def start_create(chat_id):
-    user_states[chat_id] = {"step": "title"}
+    with state_lock:
+        user_states[chat_id] = {"step": "title"}
+        drafts.pop(chat_id, None)
 
     send_message(
         chat_id,
-        "📝 Enter notification title:\n\nSend /cancel to cancel."
+        "📝 Enter notification title:\n\n"
+        "Send /cancel to cancel."
     )
 
 
@@ -272,59 +323,87 @@ def process_text(message):
         return
 
     if text == "/cancel":
-        user_states.pop(chat_id, None)
-        drafts.pop(chat_id, None)
+        with state_lock:
+            user_states.pop(chat_id, None)
+            drafts.pop(chat_id, None)
         send_message(chat_id, "❌ Cancelled.", main_keyboard())
         return
 
-    state = user_states.get(chat_id)
+    with state_lock:
+        state = user_states.get(chat_id)
+        if not state:
+            return
 
-    if not state:
-        return
+        step = state.get("step")
 
-    step = state.get("step")
+        if step == "title":
+            drafts[chat_id] = {"title": text}
+            user_states[chat_id] = {"step": "message"}
+            action = "new_message"
 
-    if step == "title":
-        drafts[chat_id] = {"title": text}
-        user_states[chat_id] = {"step": "message"}
+        elif step == "message":
+            draft = drafts.get(chat_id)
+            if not draft:
+                user_states.pop(chat_id, None)
+                action = "missing_draft"
+            else:
+                draft["message"] = text
+                user_states.pop(chat_id, None)
+                action = "preview"
+                preview = dict(draft)
+
+        elif step == "edit_title":
+            state["title"] = text
+            state["step"] = "edit_message"
+            action = "edit_message"
+
+        elif step == "edit_message":
+            notification_id = state["id"]
+            title = state["title"]
+            action = "save_edit"
+
+        else:
+            return
+
+    if action == "new_message":
         send_message(chat_id, "✉️ Enter notification message:")
 
-    elif step == "message":
-        drafts[chat_id]["message"] = text
-        user_states.pop(chat_id, None)
+    elif action == "missing_draft":
+        send_message(chat_id, "⚠️ Draft expired. Please create again.")
 
-        draft = drafts[chat_id]
+    elif action == "preview":
         keyboard = {
             "inline_keyboard": [[
-                {"text": "✅ Confirm & Send", "callback_data": "confirm_send"},
-                {"text": "❌ Cancel", "callback_data": "cancel"}
+                {
+                    "text": "✅ Confirm & Send",
+                    "callback_data": "confirm_send"
+                },
+                {
+                    "text": "❌ Cancel",
+                    "callback_data": "cancel"
+                }
             ]]
         }
-
         send_message(
             chat_id,
             "🔍 NOTIFICATION PREVIEW\n\n"
-            f"📌 Title:\n{draft['title']}\n\n"
-            f"✉️ Message:\n{draft['message']}\n\n"
-            "Send this notification to all users?",
+            f"📌 Title:\n{preview['title']}\n\n"
+            f"✉️ Message:\n{preview['message']}\n\n"
+            "Send to all users?",
             keyboard
         )
 
-    elif step == "edit_title":
-        state["title"] = text
-        state["step"] = "edit_message"
+    elif action == "edit_message":
         send_message(chat_id, "✉️ Enter the new message:")
 
-    elif step == "edit_message":
-        notification_id = state["id"]
-
+    elif action == "save_edit":
         try:
             update_notification(notification_id, {
-                "title": state["title"],
+                "title": title,
                 "message": text
             })
-
-            user_states.pop(chat_id, None)
+            with state_lock:
+                user_states.pop(chat_id, None)
 
             send_message(
                 chat_id,
@@ -332,28 +411,35 @@ def process_text(message):
                 main_keyboard()
             )
         except Exception:
-            logging.exception("Edit error")
-            send_message(chat_id, "❌ Could not update notification.")
+            logging.exception("Edit failed")
+            send_message(chat_id, "❌ Could not update history.")
 
 
 def confirm_send(chat_id):
-    draft = drafts.get(chat_id)
+    with state_lock:
+        draft = drafts.get(chat_id)
+        if draft:
+            draft = dict(draft)
+            # Prevent repeated taps from sending the same draft twice.
+            drafts.pop(chat_id, None)
 
     if not draft:
-        send_message(chat_id, "⚠️ No notification draft found.")
+        send_message(
+            chat_id,
+            "⚠️ No draft found. Create a new notification.",
+            main_keyboard()
+        )
         return
 
     title = draft["title"]
-    message = draft["message"]
+    body = draft["message"]
     notification_id = None
 
-    send_message(chat_id, "⏳ Saving notification and sending...")
-
     try:
-        record = save_notification(title, message, "sending")
+        record = save_notification(title, body, "sending")
         notification_id = record["id"]
 
-        fcm_id = send_fcm_notification(title, message)
+        fcm_id = send_fcm_notification(title, body)
 
         update_notification(notification_id, {
             "status": "sent",
@@ -363,7 +449,7 @@ def confirm_send(chat_id):
 
         send_message(
             chat_id,
-            "✅ NOTIFICATION SENT SUCCESSFULLY\n\n"
+            "✅ NOTIFICATION SENT\n\n"
             f"📌 Title: {title}\n"
             f"🆔 Database ID: {notification_id}\n"
             f"🔥 FCM ID: {fcm_id}",
@@ -380,36 +466,40 @@ def confirm_send(chat_id):
                     "error": str(error)[:1000]
                 })
             except Exception:
-                logging.exception("Failed to update status")
+                logging.exception("Failed to update notification status")
 
         send_message(
             chat_id,
-            f"❌ Sending failed:\n{str(error)[:1200]}",
+            "❌ Sending failed:\n"
+            f"{str(error)[:1000]}",
             main_keyboard()
         )
-    finally:
-        drafts.pop(chat_id, None)
 
 
-# ================= HISTORY =================
+# ================ HISTORY ================
 
 def show_history(chat_id):
     try:
         records = get_notifications(10)
 
         if not records:
-            send_message(chat_id, "📚 No notification history.", main_keyboard())
+            send_message(
+                chat_id, "📚 No notification history.", main_keyboard()
+            )
             return
 
         for item in records:
             notification_id = item.get("id")
+            title = item.get("title", "")
+            body = item.get("message", "")
+            created = item.get("created_at", "")
 
             text = (
-                f"📌 {item.get('title', '')}\n\n"
-                f"✉️ {item.get('message', '')}\n\n"
+                f"📌 {title}\n\n"
+                f"✉️ {body}\n\n"
                 f"🆔 ID: {notification_id}\n"
                 f"📊 Status: {item.get('status', 'unknown')}\n"
-                f"🕒 Created: {item.get('created_at', '')}"
+                f"🕒 Created: {created}"
             )
 
             keyboard = {
@@ -425,22 +515,30 @@ def show_history(chat_id):
                 ]]
             }
 
-            send_message(chat_id, text, keyboard)
+            send_message(chat_id, text[:4000], keyboard)
 
         send_message(chat_id, "📚 End of history.", main_keyboard())
 
     except Exception:
-        logging.exception("History error")
+        logging.exception("History loading failed")
         send_message(chat_id, "❌ Could not load history.")
 
 
-# ================= CALLBACK HANDLER =================
+# ================ CALLBACK HANDLER ================
 
 def process_callback(callback):
-    chat_id = callback["message"]["chat"]["id"]
+    callback_id = callback.get("id")
+    message = callback.get("message") or {}
+    chat = message.get("chat") or {}
+
+    if not chat.get("id"):
+        answer_callback(callback_id, "This action is not supported here.")
+        return
+
+    chat_id = chat["id"]
     data = callback.get("data", "")
 
-    answer_callback(callback["id"])
+    answer_callback(callback_id)
 
     if data == "dashboard":
         show_dashboard(chat_id)
@@ -455,43 +553,35 @@ def process_callback(callback):
         show_history(chat_id)
 
     elif data == "cancel":
-        user_states.pop(chat_id, None)
-        drafts.pop(chat_id, None)
+        with state_lock:
+            user_states.pop(chat_id, None)
+            drafts.pop(chat_id, None)
         send_message(chat_id, "❌ Operation cancelled.", main_keyboard())
 
     elif data.startswith("edit:"):
         notification_id = data.split(":", 1)[1]
 
         try:
-            records = supabase_request(
-                "GET",
-                params={
-                    "id": f"eq.{notification_id}",
-                    "select": "*"
-                }
-            )
-
-            if not records:
+            item = get_notification(notification_id)
+            if not item:
                 send_message(chat_id, "❌ Notification not found.")
                 return
 
-            item = records[0]
-
-            user_states[chat_id] = {
-                "step": "edit_title",
-                "id": notification_id,
-                "title": ""
-            }
+            with state_lock:
+                user_states[chat_id] = {
+                    "step": "edit_title",
+                    "id": notification_id,
+                    "title": ""
+                }
 
             send_message(
                 chat_id,
                 "✏️ EDIT NOTIFICATION\n\n"
-                f"Current title:\n{item.get('title', '')}\n\n"
+                f"Current title: {item.get('title', '')}\n\n"
                 "Enter the new title:"
             )
-
         except Exception:
-            logging.exception("Edit lookup error")
+            logging.exception("Edit lookup failed")
             send_message(chat_id, "❌ Could not load notification.")
 
     elif data.startswith("delete:"):
@@ -512,7 +602,7 @@ def process_callback(callback):
 
         send_message(
             chat_id,
-            f"⚠️ Delete notification history ID {notification_id}?",
+            f"⚠️ Delete history record ID {notification_id}?",
             keyboard
         )
 
@@ -520,18 +610,21 @@ def process_callback(callback):
         notification_id = data.split(":", 1)[1]
 
         try:
+            item = get_notification(notification_id)
+            if not item:
+                send_message(chat_id, "❌ Notification not found.")
+                return
+
             delete_notification(notification_id)
             send_message(
-                chat_id,
-                "🗑 Notification history deleted.",
-                main_keyboard()
+                chat_id, "🗑 History record deleted.", main_keyboard()
             )
         except Exception:
-            logging.exception("Delete error")
-            send_message(chat_id, "❌ Could not delete notification.")
+            logging.exception("Delete failed")
+            send_message(chat_id, "❌ Could not delete history record.")
 
 
-# ================= UPDATE HANDLER =================
+# ================ UPDATE HANDLER ================
 
 def process_update(update):
     if not is_admin(update):
@@ -542,21 +635,24 @@ def process_update(update):
         process_callback(update["callback_query"])
         return
 
-    if "message" not in update:
+    message = update.get("message")
+    if not message:
         return
 
-    message = update["message"]
+    text = message.get("text", "").strip()
     chat_id = message["chat"]["id"]
-    text = message.get("text", "")
+    command = text.split()[0].split("@")[0] if text else ""
 
-    if text.split("@")[0] in ("/start", "/menu"):
-        user_states.pop(chat_id, None)
-        drafts.pop(chat_id, None)
+    if command in ("/start", "/menu"):
+        with state_lock:
+            user_states.pop(chat_id, None)
+            drafts.pop(chat_id, None)
         show_dashboard(chat_id)
 
-    elif text.split("@")[0] == "/cancel":
-        user_states.pop(chat_id, None)
-        drafts.pop(chat_id, None)
+    elif command == "/cancel":
+        with state_lock:
+            user_states.pop(chat_id, None)
+            drafts.pop(chat_id, None)
         send_message(chat_id, "❌ Cancelled.", main_keyboard())
 
     elif text.startswith("/"):
@@ -566,27 +662,35 @@ def process_update(update):
         process_text(message)
 
 
-# ================= WEBHOOK =================
+# ================ WEBHOOK ENDPOINT ================
 
 @app.route("/telegram-webhook", methods=["POST"])
 def telegram_webhook():
     if not WEBHOOK_SECRET:
-        return jsonify({"error": "Webhook secret is not configured"}), 503
+        return jsonify({
+            "ok": False,
+            "error": "Webhook secret is not configured"
+        }), 503
 
     supplied_secret = request.headers.get(
         "X-Telegram-Bot-Api-Secret-Token", ""
     )
 
     if supplied_secret != WEBHOOK_SECRET:
-        return jsonify({"error": "Unauthorized"}), 401
+        logging.warning("Webhook rejected: secret mismatch")
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
     update = request.get_json(silent=True)
 
     if not isinstance(update, dict):
-        return jsonify({"ok": False, "error": "Invalid update"}), 400
+        return jsonify({
+            "ok": False,
+            "error": "Invalid JSON update"
+        }), 400
 
     update_id = update.get("update_id")
 
+    # This cache is best-effort only; it is not persistent across restarts.
     if update_id is not None:
         with processed_lock:
             if update_id in processed_updates:
@@ -594,8 +698,7 @@ def telegram_webhook():
 
             processed_updates.add(update_id)
 
-            # Keep the in-memory duplicate cache bounded.
-            if len(processed_updates) > 2000:
+            if len(processed_updates) > 5000:
                 processed_updates.clear()
                 processed_updates.add(update_id)
 
@@ -603,39 +706,84 @@ def telegram_webhook():
         process_update(update)
     except Exception:
         logging.exception("Webhook update processing failed")
-
-        # Telegram can retry the update if it receives a non-2xx response.
+        if update_id is not None:
+            with processed_lock:
+                processed_updates.discard(update_id)
         return jsonify({"ok": False}), 500
 
     return jsonify({"ok": True})
 
 
-# ================= REGISTER WEBHOOK =================
+# ================ WEBHOOK REGISTRATION ================
 
 def setup_webhook():
-    if not BOT_TOKEN or not WEBHOOK_URL or not WEBHOOK_SECRET:
+    if not BOT_TOKEN:
+        logging.error("TELEGRAM_BOT_TOKEN is missing")
+        return
+
+    if not WEBHOOK_URL or not WEBHOOK_SECRET:
+        logging.error("WEBHOOK_URL or WEBHOOK_SECRET is missing")
+        return
+
+    parsed = urlparse(WEBHOOK_URL)
+
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
         logging.error(
-            "Missing TELEGRAM_BOT_TOKEN, WEBHOOK_URL or WEBHOOK_SECRET"
+            "Invalid WEBHOOK_URL. Use the base HTTPS Render URL only."
         )
         return
 
+    valid_secret = (
+        1 <= len(WEBHOOK_SECRET) <= 256
+        and all(
+            c.isascii() and (c.isalnum() or c in "_-")
+            for c in WEBHOOK_SECRET
+        )
+    )
+
+    if not valid_secret:
+        logging.error(
+            "Invalid WEBHOOK_SECRET: use only letters, numbers, _ and -"
+        )
+        return
+
+    webhook = WEBHOOK_URL + "/telegram-webhook"
+
     try:
         result = telegram("setWebhook", {
-            "url": WEBHOOK_URL + "/telegram-webhook",
+            "url": webhook,
             "secret_token": WEBHOOK_SECRET,
             "allowed_updates": ["message", "callback_query"],
             "drop_pending_updates": False
         })
 
-        logging.info("Webhook registration result: %s", result)
+        logging.info(
+            "Webhook registration successful: %s",
+            result.get("description", "OK")
+        )
 
-    except Exception:
-        logging.exception("Webhook registration failed")
+        info = telegram("getWebhookInfo").get("result", {})
+        logging.info(
+            "Webhook info: url=%s, pending=%s, last_error=%s",
+            info.get("url", ""),
+            info.get("pending_update_count", 0),
+            info.get("last_error_message", "")
+        )
+
+    except Exception as error:
+        # Do not crash the Flask app solely because registration failed.
+        logging.error("Webhook registration failed: %s", error)
 
 
-# ================= FLASK ROUTES =================
+# ================ HEALTH ROUTES ================
 
-@app.route("/")
+@app.route("/", methods=["GET"])
 def home():
     return jsonify({
         "status": "live",
@@ -644,14 +792,14 @@ def home():
     })
 
 
-@app.route("/health")
+@app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
 
 
-# Register webhook when Gunicorn imports this module.
-# Use one Gunicorn worker so process-local state is shared.
-if BOT_TOKEN and WEBHOOK_URL and WEBHOOK_SECRET:
+# Register when Gunicorn imports main.py.
+if __name__ == "__main__":
     setup_webhook()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
 else:
-    logging.error("Webhook environment variables are missing")
+    setup_webhook()
