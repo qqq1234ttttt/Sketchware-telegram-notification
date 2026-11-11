@@ -1,6 +1,4 @@
-
 Flask
 requests
 PyJWT
 cryptography
-gunicorn
