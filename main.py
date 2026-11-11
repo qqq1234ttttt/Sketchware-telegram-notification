@@ -1,674 +1,690 @@
-
 import os
 import time
 import threading
 import logging
-import requests
-import jwt
+from datetime import datetime, timezone
 
+import requests
+import firebase_admin
+from firebase_admin import credentials, messaging
 from flask import Flask, jsonify
 
+# ================= CONFIG =================
+
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+ADMIN_ID = os.environ.get("TELEGRAM_ADMIN_ID", "")
+PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")
+CLIENT_EMAIL = os.environ.get("FIREBASE_CLIENT_EMAIL", "")
+PRIVATE_KEY = os.environ.get("FIREBASE_PRIVATE_KEY", "").replace("\\n", "\n")
+
+API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
+# ================= STATE =================
 
-# ==================================================
-# ENVIRONMENT VARIABLES
-# ==================================================
+lock = threading.RLock()
+offset = 0
+drafts = {}
+history = []
+current_job = None
+next_id = 1
+last_activity = "Bot started"
+started_at = time.time()
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
+# ================= FIREBASE =================
 
-FIREBASE_PROJECT_ID = os.getenv(
-    "FIREBASE_PROJECT_ID", ""
-).strip()
+firebase_ready = False
 
-FIREBASE_CLIENT_EMAIL = os.getenv(
-    "FIREBASE_CLIENT_EMAIL", ""
-).strip()
-
-FIREBASE_PRIVATE_KEY = os.getenv(
-    "FIREBASE_PRIVATE_KEY", ""
-).strip()
-
-FIREBASE_PRIVATE_KEY = FIREBASE_PRIVATE_KEY.replace(
-    "\\n", "\n"
-).strip()
-
-if (
-    len(FIREBASE_PRIVATE_KEY) >= 2
-    and FIREBASE_PRIVATE_KEY[0] == '"'
-    and FIREBASE_PRIVATE_KEY[-1] == '"'
-):
-    FIREBASE_PRIVATE_KEY = FIREBASE_PRIVATE_KEY[1:-1]
-
-TELEGRAM_API = (
-    f"https://api.telegram.org/bot{BOT_TOKEN}"
-)
-
-OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
-
-FCM_SCOPE = (
-    "https://www.googleapis.com/auth/firebase.messaging"
-)
-
-user_states = {}
-
-polling_started = False
-polling_lock = threading.Lock()
-
-# Duplicate update protection within this process
-processed_update_ids = set()
-processed_update_lock = threading.Lock()
-MAX_PROCESSED_UPDATES = 2000
-
-# Confirm button protection
-sending_users = set()
-sending_users_lock = threading.Lock()
+try:
+    if all([PROJECT_ID, CLIENT_EMAIL, PRIVATE_KEY]):
+        cred = credentials.Certificate({
+            "type": "service_account",
+            "project_id": PROJECT_ID,
+            "private_key": PRIVATE_KEY,
+            "client_email": CLIENT_EMAIL,
+            "token_uri": "https://oauth2.googleapis.com/token",
+        })
+        firebase_admin.initialize_app(cred)
+        firebase_ready = True
+        logging.info("Firebase initialized")
+    else:
+        logging.warning("Firebase credentials are not configured")
+except Exception:
+    logging.exception("Firebase initialization failed")
 
 
-# ==================================================
-# COMMON HELPERS
-# ==================================================
+# ================= TELEGRAM =================
 
-def is_admin(user_id):
-    return (
-        bool(ADMIN_ID)
-        and user_id is not None
-        and str(user_id) == ADMIN_ID
-    )
-
-
-def telegram(method, data=None, timeout=25):
+def tg(method, data=None):
     if not BOT_TOKEN:
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN Secret မရှိပါ။"
-        )
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
 
     response = requests.post(
-        f"{TELEGRAM_API}/{method}",
+        f"{API}/{method}",
         json=data or {},
-        timeout=timeout
+        timeout=30
     )
+    response.raise_for_status()
+    result = response.json()
 
-    try:
-        result = response.json()
-    except ValueError:
-        response.raise_for_status()
-        raise RuntimeError(
-            "Telegram မှ JSON တုံ့ပြန်ချက် မရပါ။"
-        )
+    if not result.get("ok"):
+        raise RuntimeError(result.get("description", "Telegram API error"))
 
-    if not response.ok or not result.get("ok"):
-        description = result.get(
-            "description",
-            response.text[:1000]
-        )
-
-        raise RuntimeError(
-            f"Telegram API Error ({response.status_code}): "
-            f"{description}"
-        )
-
-    return result.get("result")
+    return result["result"]
 
 
-def send_message(chat_id, text, keyboard=None):
+def send_text(chat_id, text, keyboard=None):
     data = {
         "chat_id": chat_id,
-        "text": str(text)[:4000]
+        "text": text,
     }
 
     if keyboard:
-        data["reply_markup"] = keyboard
+        data["reply_markup"] = {"inline_keyboard": keyboard}
 
-    return telegram("sendMessage", data)
+    return tg("sendMessage", data)
+
+
+def edit_text(chat_id, message_id, text, keyboard=None):
+    data = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+    }
+
+    if keyboard:
+        data["reply_markup"] = {"inline_keyboard": keyboard}
+
+    try:
+        tg("editMessageText", data)
+    except Exception:
+        send_text(chat_id, text, keyboard)
+
+
+def is_admin(update):
+    user = update.get("from", {})
+    return bool(ADMIN_ID) and str(user.get("id", "")) == ADMIN_ID
 
 
 def main_menu():
-    return {
-        "inline_keyboard": [
-            [
-                {
-                    "text": "📊 စနစ်အခြေအနေ",
-                    "callback_data": "status"
-                },
-                {
-                    "text": "➕ Noti အသစ်ပို့ရန်",
-                    "callback_data": "create"
-                }
-            ],
-            [
-                {
-                    "text": "❌ ပယ်ဖျက်ရန်",
-                    "callback_data": "cancel"
-                }
-            ]
-        ]
-    }
+    return [
+        [
+            {"text": "📊 Dashboard", "callback_data": "dashboard"},
+            {"text": "📝 Create Notification", "callback_data": "create"},
+        ],
+        [
+            {"text": "📚 Notification History", "callback_data": "history"},
+            {"text": "❌ Cancel", "callback_data": "cancel"},
+        ],
+    ]
 
 
-def confirm_menu():
-    return {
-        "inline_keyboard": [
-            [
-                {
-                    "text": "✅ အခုပို့မယ်",
-                    "callback_data": "confirm_send"
-                },
-                {
-                    "text": "✏️ ပြန်ပြင်မယ်",
-                    "callback_data": "re_create"
-                }
-            ],
-            [
-                {
-                    "text": "❌ ဖျက်သိမ်းမယ်",
-                    "callback_data": "cancel"
-                }
-            ]
-        ]
-    }
+def home(chat_id, text="KMT Notification Admin"):
+    send_text(chat_id, text, main_menu())
 
 
-# ==================================================
-# FIREBASE ACCESS TOKEN
-# ==================================================
-
-def get_fb_access_token():
-    if not FIREBASE_CLIENT_EMAIL:
-        raise RuntimeError(
-            "FIREBASE_CLIENT_EMAIL Secret မရှိပါ။"
-        )
-
-    if not FIREBASE_PRIVATE_KEY:
-        raise RuntimeError(
-            "FIREBASE_PRIVATE_KEY Secret မရှိပါ။"
-        )
-
-    if (
-        "-----BEGIN PRIVATE KEY-----"
-        not in FIREBASE_PRIVATE_KEY
-        or "-----END PRIVATE KEY-----"
-        not in FIREBASE_PRIVATE_KEY
-    ):
-        raise RuntimeError(
-            "FIREBASE_PRIVATE_KEY ပုံစံမမှန်ပါ။"
-        )
-
-    now = int(time.time())
-
-    payload = {
-        "iss": FIREBASE_CLIENT_EMAIL,
-        "scope": FCM_SCOPE,
-        "aud": OAUTH_TOKEN_URL,
-        "iat": now,
-        "exp": now + 3600
-    }
-
+def answer_callback(callback_id, text=""):
     try:
-        signed_jwt = jwt.encode(
-            payload,
-            FIREBASE_PRIVATE_KEY,
-            algorithm="RS256"
-        )
-    except Exception as e:
-        raise RuntimeError(
-            f"Firebase Private Key အမှား: {e}"
-        ) from e
-
-    try:
-        response = requests.post(
-            OAUTH_TOKEN_URL,
-            data={
-                "grant_type":
-                    "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                "assertion": signed_jwt
-            },
-            timeout=30
-        )
-    except requests.RequestException as e:
-        raise RuntimeError(
-            f"Google OAuth ချိတ်ဆက်မှုအမှား: {e}"
-        ) from e
-
-    if not response.ok:
-        try:
-            detail = response.json()
-        except ValueError:
-            detail = response.text[:1000]
-
-        raise RuntimeError(
-            f"OAuth HTTP {response.status_code}: {detail}"
-        )
-
-    access_token = response.json().get("access_token")
-
-    if not access_token:
-        raise RuntimeError(
-            "Firebase Access Token မရရှိပါ။"
-        )
-
-    return access_token
-
-
-# ==================================================
-# FIREBASE FCM NOTIFICATION
-# ==================================================
-
-def send_fcm_notification(title, message):
-    if not FIREBASE_PROJECT_ID:
-        raise RuntimeError(
-            "FIREBASE_PROJECT_ID Secret မရှိပါ။"
-        )
-
-    access_token = get_fb_access_token()
-
-    url = (
-        "https://fcm.googleapis.com/v1/projects/"
-        f"{FIREBASE_PROJECT_ID}/messages:send"
-    )
-
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
-
-    body = {
-        "message": {
-            "topic": "all",
-            "notification": {
-                "title": title,
-                "body": message
-            }
-        }
-    }
-
-    try:
-        response = requests.post(
-            url,
-            json=body,
-            headers=headers,
-            timeout=30
-        )
-    except requests.RequestException as e:
-        raise RuntimeError(
-            f"Firebase ချိတ်ဆက်မှုအမှား: {e}"
-        ) from e
-
-    if not response.ok:
-        try:
-            detail = response.json()
-        except ValueError:
-            detail = response.text[:1500]
-
-        raise RuntimeError(
-            f"FCM HTTP {response.status_code}: {detail}"
-        )
-
-    return response.json()
-
-
-# ==================================================
-# TELEGRAM CALLBACK HANDLER
-# ==================================================
-
-def handle_callback(update):
-    query = update.get("callback_query", {})
-
-    if not query:
-        return
-
-    query_id = query.get("id")
-    data = query.get("data", "")
-    user = query.get("from", {})
-    user_id = user.get("id")
-
-    chat_id = (
-        query.get("message", {})
-        .get("chat", {})
-        .get("id")
-    )
-
-    # Button ကို နှိပ်ပြီးကြောင်း Telegram ကို ချက်ချင်းပြောရန်
-    try:
-        telegram(
-            "answerCallbackQuery",
-            {"callback_query_id": query_id}
-        )
+        tg("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": text,
+        })
     except Exception:
-        logging.exception(
-            "Callback acknowledgement failed"
+        logging.exception("Callback answer failed")
+
+
+# ================= DASHBOARD =================
+
+def dashboard(chat_id):
+    with lock:
+        count = len(history)
+        job = dict(current_job) if current_job else None
+        activity = last_activity
+
+    firebase_status = "✅ Connected" if firebase_ready else "❌ Not configured"
+
+    job_text = "No active sending job"
+
+    if job:
+        job_text = (
+            f"Status: {job['status']}\n"
+            f"Progress: {job['done']}/{job['total']}\n"
+            f"Success: {job['success']}\n"
+            f"Failed: {job['failed']}"
         )
 
-    if not is_admin(user_id):
-        if chat_id:
-            send_message(
+    text = (
+        "📊 ADMIN DASHBOARD\n\n"
+        f"🤖 Telegram: {'✅ Configured' if BOT_TOKEN else '❌ Missing token'}\n"
+        f"🔥 Firebase: {firebase_status}\n"
+        f"📚 History records: {count}\n"
+        f"⏱ Uptime: {int(time.time() - started_at)} seconds\n"
+        f"📌 Last activity: {activity}\n\n"
+        f"🚀 Sending status:\n{job_text}"
+    )
+
+    send_text(chat_id, text, main_menu())
+
+
+# ================= CREATE / EDIT =================
+
+def start_create(chat_id, user_id):
+    with lock:
+        drafts[user_id] = {
+            "title": "",
+            "body": "",
+            "step": "title",
+            "editing_id": None,
+        }
+
+    send_text(
+        chat_id,
+        "📝 CREATE NOTIFICATION\n\n"
+        "Notification Title ကို ပို့ပါ။\n"
+        "ပယ်ဖျက်ရန် /cancel ကို ပို့ပါ။"
+    )
+
+
+def start_edit(chat_id, user_id, notification_id):
+    with lock:
+        item = next(
+            (x for x in history if x["id"] == notification_id),
+            None
+        )
+
+        if not item:
+            send_text(chat_id, "❌ Notification မတွေ့ပါ။")
+            return
+
+        drafts[user_id] = {
+            "title": item["title"],
+            "body": item["body"],
+            "step": "edit_title",
+            "editing_id": notification_id,
+        }
+
+    send_text(
+        chat_id,
+        "✏️ EDIT NOTIFICATION\n\n"
+        f"လက်ရှိ Title: {item['title']}\n"
+        "Title အသစ်ပို့ပါ။ မပြောင်းလိုလျှင် /skip ပို့ပါ။"
+    )
+
+
+def show_preview(chat_id, user_id):
+    with lock:
+        draft = drafts.get(user_id)
+
+        if not draft:
+            send_text(chat_id, "Draft မရှိတော့ပါ။ /start နှိပ်ပါ။")
+            return
+
+        title = draft["title"]
+        body = draft["body"]
+
+    keyboard = [
+        [
+            {"text": "✅ Confirm & Send", "callback_data": "confirm"},
+        ],
+        [
+            {"text": "✏️ Edit Title", "callback_data": "edit_title"},
+            {"text": "✏️ Edit Message", "callback_data": "edit_body"},
+        ],
+        [
+            {"text": "❌ Cancel", "callback_data": "cancel"},
+        ],
+    ]
+
+    send_text(
+        chat_id,
+        f"👁 NOTIFICATION PREVIEW\n\n"
+        f"📌 Title: {title}\n\n"
+        f"💬 Message:\n{body}\n\n"
+        "အချက်အလက်တွေ မှန်ကန်ပါက Confirm & Send နှိပ်ပါ။",
+        keyboard
+    )
+
+
+def handle_draft_message(chat_id, user_id, text):
+    with lock:
+        draft = drafts.get(user_id)
+
+    if not draft:
+        return False
+
+    if text == "/cancel":
+        with lock:
+            drafts.pop(user_id, None)
+        home(chat_id, "❌ Draft cancelled.")
+        return True
+
+    if text == "/skip":
+        if draft["step"] == "edit_title":
+            with lock:
+                drafts[user_id]["step"] = "edit_body"
+            send_text(
                 chat_id,
-                "⛔ Admin သာ အသုံးပြုနိုင်ပါတယ်။"
+                "Message အသစ်ပို့ပါ။ မပြောင်းလိုလျှင် /skip ပို့ပါ။"
             )
-        return
+            return True
 
-    if not chat_id:
-        return
+        if draft["step"] == "edit_body":
+            show_preview(chat_id, user_id)
+            return True
 
-    user_key = str(user_id)
+    step = draft["step"]
 
-    try:
-        if data == "status":
-            send_message(
-                chat_id,
-                "📊 စနစ်အခြေအနေ\n\n"
-                "🟢 Telegram Backend: အလုပ်လုပ်နေသည်\n"
-                "ℹ️ Firebase အခြေအနေကို အမှန်သိရန် "
-                "Notification စမ်းပို့ရပါမည်။",
-                main_menu()
-            )
+    if step in ("title", "edit_title"):
+        if len(text) > 100:
+            send_text(chat_id, "Title ကို စာလုံး 100 ထက်မကျော်ပါစေနဲ့။")
+            return True
 
-        elif data == "create":
-            user_states[user_key] = {
-                "step": "title"
-            }
-
-            send_message(
-                chat_id,
-                "➕ Notification အသစ်ပြုလုပ်ပါမယ်။\n\n"
-                "Notification Title ကို ရိုက်ပို့ပါ။\n"
-                "ပယ်ဖျက်ရန် /cancel ကို ရိုက်ပါ။"
+        with lock:
+            drafts[user_id]["title"] = text
+            drafts[user_id]["step"] = (
+                "body" if step == "title" else "edit_body"
             )
 
-        elif data == "cancel":
-            user_states.pop(user_key, None)
+        send_text(chat_id, "💬 Notification Message ကို ပို့ပါ။")
+        return True
 
-            send_message(
-                chat_id,
-                "❌ လုပ်ဆောင်ချက်ကို ပယ်ဖျက်ပြီးပါပြီ။",
-                main_menu()
+    if step in ("body", "edit_body"):
+        if not text.strip():
+            send_text(chat_id, "Message အလွတ်မဖြစ်ရပါ။")
+            return True
+
+        with lock:
+            drafts[user_id]["body"] = text
+            drafts[user_id]["step"] = "preview"
+
+        show_preview(chat_id, user_id)
+        return True
+
+    return False
+
+
+# ================= FCM SENDING =================
+
+def send_fcm_notification(title, body):
+    if not firebase_ready:
+        raise RuntimeError("Firebase is not configured")
+
+    message = messaging.Message(
+        notification=messaging.Notification(
+            title=title,
+            body=body,
+        ),
+        topic="all",
+        android=messaging.AndroidConfig(
+            priority="high",
+            notification=messaging.AndroidNotification(
+                sound="default",
+                channel_id="default",
+            ),
+        ),
+    )
+
+    return messaging.send(message)
+
+
+def send_job(chat_id, user_id):
+    global current_job, next_id, last_activity
+
+    with lock:
+        draft = drafts.get(user_id)
+
+        if not draft:
+            send_text(chat_id, "Draft မရှိပါ။")
+            return
+
+        if current_job and current_job["status"] == "sending":
+            send_text(chat_id, "⚠️ Notification ပို့နေဆဲပါ။")
+            return
+
+        title = draft["title"].strip()
+        body = draft["body"].strip()
+        editing_id = draft.get("editing_id")
+
+        if not title or not body:
+            send_text(chat_id, "Title နဲ့ Message နှစ်ခုလုံး လိုပါတယ်။")
+            return
+
+        if editing_id:
+            item = next(
+                (x for x in history if x["id"] == editing_id),
+                None
             )
 
-        elif data == "re_create":
-            user_states[user_key] = {
-                "step": "title"
-            }
-
-            send_message(
-                chat_id,
-                "✏️ ပြန်လည်ရေးသားပါမယ်။\n\n"
-                "Notification Title အသစ်ကို ရိုက်ပို့ပါ။"
-            )
-
-        elif data == "confirm_send":
-            # User တစ်ဦးက အကြိမ်ကြိမ်နှိပ်ခြင်းကို တားရန်
-            with sending_users_lock:
-                if user_key in sending_users:
-                    return
-
-                state = user_states.get(user_key)
-
-                if (
-                    not state
-                    or state.get("step") != "confirm"
-                ):
-                    state = None
-                else:
-                    sending_users.add(user_key)
-                    # ပို့မီ state ကို ဖယ်ရှားပြီး
-                    # ထပ်နှိပ်၍ ပို့ခြင်းကို ကာကွယ်သည်
-                    user_states.pop(user_key, None)
-
-            if not state:
-                send_message(
-                    chat_id,
-                    "ℹ️ ဒီ Notification ကို ပို့ပြီးဖြစ်နိုင်ပါတယ်၊ "
-                    "သို့မဟုတ် အတည်ပြုရန် အချက်အလက်မရှိတော့ပါ။",
-                    main_menu()
-                )
+            if item:
+                item["title"] = title
+                item["body"] = body
+                item["updated_at"] = datetime.now(timezone.utc).isoformat()
+                last_activity = f"Edited notification #{editing_id}"
+                drafts.pop(user_id, None)
+                send_text(chat_id, "✅ Notification ကို ပြင်ဆင်ပြီးပါပြီ။")
                 return
 
-            title = state["title"]
-            msg_body = state["message"]
+        notification_id = next_id
+        next_id += 1
 
-            try:
-                send_message(
-                    chat_id,
-                    "⏳ Firebase သို့ Notification ပို့နေပါသည်..."
-                )
+        item = {
+            "id": notification_id,
+            "title": title,
+            "body": body,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "status": "sending",
+            "message_id": None,
+            "error": None,
+        }
 
-                send_fcm_notification(
-                    title,
-                    msg_body
-                )
+        history.insert(0, item)
+        current_job = {
+            "id": notification_id,
+            "status": "sending",
+            "total": 1,
+            "done": 0,
+            "success": 0,
+            "failed": 0,
+            "cancel": False,
+        }
 
-                send_message(
-                    chat_id,
-                    "🚀 Firebase က Notification ကို "
-                    "ပို့ရန် လက်ခံပြီးပါပြီ။\n\n"
-                    f"📌 Title: {title}\n"
-                    f"📝 Message: {msg_body}\n\n"
-                    "မှတ်ချက်: စက်အားလုံးသို့ "
-                    "ရောက်ရှိပြီးကြောင်း အာမခံခြင်းမဟုတ်ပါ။",
-                    main_menu()
-                )
+        drafts.pop(user_id, None)
+        last_activity = f"Sending notification #{notification_id}"
 
-            except Exception as e:
-                logging.exception(
-                    "FCM notification failed"
-                )
+    send_text(
+        chat_id,
+        "🚀 Sending notification...\n"
+        "Topic: all\n"
+        "Progress: 0%"
+    )
 
-                send_message(
-                    chat_id,
-                    "❌ Notification ပို့မရပါ။\n\n"
-                    f"အမှား: {str(e)[:2000]}",
-                    main_menu()
-                )
+    try:
+        message_id = send_fcm_notification(title, body)
 
-            finally:
-                with sending_users_lock:
-                    sending_users.discard(user_key)
+        with lock:
+            item["status"] = "sent"
+            item["message_id"] = message_id
 
-    except Exception as e:
-        logging.exception("Callback handler error")
+            current_job["done"] = 1
+            current_job["success"] = 1
+            current_job["status"] = "completed"
 
-        try:
-            send_message(
-                chat_id,
-                f"❌ အမှားအယွင်း: {str(e)[:1500]}",
-                main_menu()
-            )
-        except Exception:
-            logging.exception(
-                "Failed to send callback error"
-            )
+            last_activity = f"Sent notification #{notification_id}"
+
+        send_text(
+            chat_id,
+            "✅ NOTIFICATION SENT\n\n"
+            f"📌 Title: {title}\n"
+            f"🆔 History ID: {notification_id}\n"
+            f"📨 FCM Message ID: {message_id}\n"
+            "👥 Target: Topic all\n"
+            "📊 Progress: 100%"
+        )
+
+    except Exception as exc:
+        logging.exception("FCM send failed")
+
+        with lock:
+            item["status"] = "failed"
+            item["error"] = str(exc)
+
+            current_job["done"] = 1
+            current_job["failed"] = 1
+            current_job["status"] = "failed"
+
+            last_activity = f"Failed notification #{notification_id}"
+
+        send_text(
+            chat_id,
+            "❌ NOTIFICATION FAILED\n\n"
+            f"Error: {str(exc)[:800]}\n\n"
+            "Firebase credentials နဲ့ Project ID ကို စစ်ပါ။"
+        )
 
 
-# ==================================================
-# TELEGRAM MESSAGE HANDLER
-# ==================================================
+# ================= HISTORY =================
 
-def handle_message(update):
-    message = update.get("message", {})
-    user = message.get("from", {})
-    user_id = user.get("id")
-    chat_id = message.get("chat", {}).get("id")
-    text = message.get("text", "").strip()
+def show_history(chat_id):
+    with lock:
+        records = [dict(x) for x in history[:10]]
 
-    if not is_admin(user_id) or not chat_id:
+    if not records:
+        send_text(chat_id, "📚 Notification History မရှိသေးပါ။")
         return
 
-    user_key = str(user_id)
+    for item in records:
+        status = item["status"].upper()
 
-    if text in ("/start", "/menu"):
-        user_states.pop(user_key, None)
+        keyboard = [
+            [
+                {
+                    "text": "✏️ Edit",
+                    "callback_data": f"edit:{item['id']}",
+                },
+                {
+                    "text": "🗑 Delete",
+                    "callback_data": f"delete:{item['id']}",
+                },
+            ]
+        ]
 
-        send_message(
+        send_text(
             chat_id,
-            "⚙️ Admin Control Panel မှ ကြိုဆိုပါတယ်။",
-            main_menu()
+            f"🆔 ID: {item['id']}\n"
+            f"📌 Title: {item['title']}\n"
+            f"💬 Message: {item['body']}\n"
+            f"📊 Status: {status}\n"
+            f"🕒 Created: {item['created_at']}",
+            keyboard
         )
+
+
+def delete_history_item(chat_id, notification_id):
+    with lock:
+        item = next(
+            (x for x in history if x["id"] == notification_id),
+            None
+        )
+
+        if not item:
+            send_text(chat_id, "❌ Notification မတွေ့ပါ။")
+            return
+
+        if item["status"] == "sending":
+            send_text(chat_id, "⚠️ ပို့နေဆဲ Notification ကို မဖျက်နိုင်ပါ။")
+            return
+
+        history.remove(item)
+
+    send_text(
+        chat_id,
+        f"🗑 History #{notification_id} ကို ဖျက်ပြီးပါပြီ။\n"
+        "သတိပြုရန်: ဖုန်းထဲရောက်ပြီးသား Notification ကို ဒီလုပ်ဆောင်ချက်က "
+        "ပြန်မဖျက်နိုင်ပါ။"
+    )
+
+
+# ================= CALLBACKS =================
+
+def handle_callback(query):
+    data = query.get("data", "")
+    chat_id = query["message"]["chat"]["id"]
+    user_id = query["from"]["id"]
+
+    answer_callback(query["id"])
+
+    if data == "dashboard":
+        dashboard(chat_id)
+        return
+
+    if data == "create":
+        start_create(chat_id, user_id)
+        return
+
+    if data == "history":
+        show_history(chat_id)
+        return
+
+    if data == "cancel":
+        with lock:
+            drafts.pop(user_id, None)
+        home(chat_id, "❌ Current draft cancelled.")
+        return
+
+    if data == "confirm":
+        with lock:
+            draft = drafts.get(user_id)
+
+            if not draft or draft.get("step") != "preview":
+                send_text(chat_id, "Draft မရှိပါ။ ပြန်စပါ။")
+                return
+
+        threading.Thread(
+            target=send_job,
+            args=(chat_id, user_id),
+            daemon=True
+        ).start()
+        return
+
+    if data == "edit_title":
+        with lock:
+            if user_id not in drafts:
+                send_text(chat_id, "Draft မရှိပါ။")
+                return
+            drafts[user_id]["step"] = "edit_title"
+
+        send_text(chat_id, "Title အသစ်ပို့ပါ။")
+        return
+
+    if data == "edit_body":
+        with lock:
+            if user_id not in drafts:
+                send_text(chat_id, "Draft မရှိပါ။")
+                return
+            drafts[user_id]["step"] = "edit_body"
+
+        send_text(chat_id, "Message အသစ်ပို့ပါ။")
+        return
+
+    if data.startswith("edit:"):
+        try:
+            notification_id = int(data.split(":")[1])
+            start_edit(chat_id, user_id, notification_id)
+        except ValueError:
+            send_text(chat_id, "ID မှားနေပါတယ်။")
+        return
+
+    if data.startswith("delete:"):
+        try:
+            notification_id = int(data.split(":")[1])
+            delete_history_item(chat_id, notification_id)
+        except ValueError:
+            send_text(chat_id, "ID မှားနေပါတယ်။")
+        return
+
+
+# ================= UPDATE HANDLER =================
+
+def process_update(update):
+    if not is_admin(update):
+        message = update.get("message", {})
+        query = update.get("callback_query", {})
+        chat = message.get("chat", {}).get("id")
+
+        if chat:
+            send_text(chat, "⛔ Access denied.")
+        elif query:
+            answer_callback(query["id"], "Access denied")
+        return
+
+    if "callback_query" in update:
+        handle_callback(update["callback_query"])
+        return
+
+    message = update.get("message")
+
+    if not message or "text" not in message:
+        return
+
+    chat_id = message["chat"]["id"]
+    user_id = message["from"]["id"]
+    text = message["text"].strip()
+
+    if text == "/start":
+        home(chat_id, "🤖 KMT Notification Admin Bot")
         return
 
     if text == "/cancel":
-        user_states.pop(user_key, None)
-
-        send_message(
-            chat_id,
-            "❌ လုပ်ဆောင်ချက်ကို ပယ်ဖျက်ပြီးပါပြီ။",
-            main_menu()
-        )
+        with lock:
+            drafts.pop(user_id, None)
+        home(chat_id, "❌ Cancelled.")
         return
 
-    state = user_states.get(user_key)
-
-    if not state:
+    if text == "/dashboard":
+        dashboard(chat_id)
         return
 
-    if not text:
-        send_message(
-            chat_id,
-            "စာသားကို ရိုက်ပို့ပေးပါ။"
-        )
+    if text == "/history":
+        show_history(chat_id)
         return
 
-    if state["step"] == "title":
-        user_states[user_key] = {
-            "step": "message",
-            "title": text
-        }
-
-        send_message(
-            chat_id,
-            f"📌 Title: {text}\n\n"
-            "ယခု Notification Message ကို ရိုက်ပို့ပါ။"
-        )
+    if handle_draft_message(chat_id, user_id, text):
         return
 
-    if state["step"] == "message":
-        user_states[user_key] = {
-            "step": "confirm",
-            "title": state["title"],
-            "message": text
-        }
-
-        send_message(
-            chat_id,
-            "❓ ဒီအချက်အလက်တွေအတိုင်း ပို့မှာ သေချာပါသလား။\n\n"
-            f"📌 Title: {state['title']}\n"
-            f"📝 Message: {text}",
-            confirm_menu()
-        )
+    home(chat_id, "Menu ကနေ ရွေးချယ်ပါ။")
 
 
-# ==================================================
-# TELEGRAM LONG POLLING
-# ==================================================
+# ================= TELEGRAM POLLING =================
 
-def telegram_polling():
-    global polling_started
+def polling_loop():
+    global offset
 
-    with polling_lock:
-        if polling_started:
-            return
-
-        polling_started = True
-
-    offset = 0
-
-    logging.info("Telegram Polling Started")
+    if not BOT_TOKEN:
+        logging.error("TELEGRAM_BOT_TOKEN missing; polling disabled")
+        return
 
     while True:
         try:
-            updates = telegram(
-                "getUpdates",
-                {
-                    "offset": offset,
-                    "timeout": 15,
-                    "allowed_updates": [
-                        "message",
-                        "callback_query"
-                    ]
-                },
-                timeout=25
-            )
+            updates = tg("getUpdates", {
+                "offset": offset,
+                "timeout": 25,
+                "allowed_updates": ["message", "callback_query"],
+            })
 
             for update in updates:
-                update_id = update.get("update_id")
-
-                if update_id is None:
-                    continue
-
-                # Telegram Update တစ်ခုကို process တစ်ခုအတွင်း
-                # နှစ်ခါမကိုင်တွယ်စေရန်
-                with processed_update_lock:
-                    if update_id in processed_update_ids:
-                        offset = max(offset, update_id + 1)
-                        continue
-
-                    processed_update_ids.add(update_id)
-
-                    if len(processed_update_ids) > MAX_PROCESSED_UPDATES:
-                        processed_update_ids.clear()
-                        processed_update_ids.add(update_id)
-
-                offset = max(offset, update_id + 1)
+                offset = max(offset, update["update_id"] + 1)
 
                 try:
-                    if "callback_query" in update:
-                        handle_callback(update)
-
-                    elif "message" in update:
-                        handle_message(update)
-
+                    process_update(update)
                 except Exception:
-                    logging.exception(
-                        "Update handler error"
-                    )
+                    logging.exception("Update processing failed")
 
         except Exception:
-            logging.exception(
-                "Telegram polling network error"
-            )
-            time.sleep(3)
+            logging.exception("Telegram polling error")
+            time.sleep(5)
 
 
-# ==================================================
-# FLASK ROUTES
-# ==================================================
+# ================= RENDER HEALTH =================
 
 @app.route("/")
 def index():
     return jsonify({
-        "status": "healthy",
-        "engine": "render_active"
+        "service": "KMT Telegram FCM Notification Bot",
+        "status": "running",
+        "firebase_ready": firebase_ready,
     })
 
 
 @app.route("/health")
 def health():
-    return jsonify({
-        "status": "ok"
-    }), 200
-
-
-# ==================================================
-# START TELEGRAM POLLING
-# Gunicorn ဖြင့် Run လုပ်သည့်အခါလည်း စတင်ရန်
-# ==================================================
-
-threading.Thread(
-    target=telegram_polling,
-    daemon=True,
-    name="telegram-polling"
-).start()
+    return jsonify({"status": "ok"})
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
+    threading.Thread(
+        target=polling_loop,
+        daemon=True
+    ).start()
 
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        threaded=True
-    )
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
