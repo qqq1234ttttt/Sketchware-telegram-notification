@@ -57,9 +57,17 @@ FCM_SCOPE = (
     "https://www.googleapis.com/auth/firebase.messaging"
 )
 
+
 user_states = {}
+
 polling_started = False
 polling_lock = threading.Lock()
+
+# Update တစ်ခုကို ထပ်မံလုပ်ဆောင်ခြင်းမှ ကာကွယ်ရန်
+processed_update_ids = set()
+processed_update_lock = threading.Lock()
+MAX_PROCESSED_UPDATES = 2000
+
 
 
 # ==================================================
@@ -521,17 +529,38 @@ def telegram_polling():
                 timeout=20
             )
 
-            for update in updates:
-                offset = update["update_id"] + 1
+            
+for update in updates:
+    update_id = update.get("update_id")
 
-                try:
-                    if "callback_query" in update:
-                        handle_callback(update)
-                    elif "message" in update:
-                        handle_message(update)
+    if update_id is None:
+        continue
 
-                except Exception:
-                    logging.exception("Update handler error")
+    offset = update_id + 1
+
+    with processed_update_lock:
+        if update_id in processed_update_ids:
+            logging.info(
+                "Duplicate update skipped: %s",
+                update_id
+            )
+            continue
+
+        processed_update_ids.add(update_id)
+
+        if len(processed_update_ids) > MAX_PROCESSED_UPDATES:
+            processed_update_ids.clear()
+            processed_update_ids.add(update_id)
+
+    try:
+        if "callback_query" in update:
+            handle_callback(update)
+        elif "message" in update:
+            handle_message(update)
+
+    except Exception:
+        logging.exception("Update handler error")
+
 
         except Exception:
             logging.exception("Telegram polling error")
