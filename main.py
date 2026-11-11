@@ -16,28 +16,17 @@ logging.basicConfig(
 
 # ==================================================
 # ENVIRONMENT VARIABLES
-# မူလ GitHub Secrets နာမည်များ မပြောင်းထားပါ
 # ==================================================
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
 
-FIREBASE_PROJECT_ID = os.getenv(
-    "FIREBASE_PROJECT_ID", ""
-).strip()
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
+FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL", "").strip()
+FIREBASE_PRIVATE_KEY = os.getenv("FIREBASE_PRIVATE_KEY", "").strip()
 
-FIREBASE_CLIENT_EMAIL = os.getenv(
-    "FIREBASE_CLIENT_EMAIL", ""
-).strip()
-
-FIREBASE_PRIVATE_KEY = os.getenv(
-    "FIREBASE_PRIVATE_KEY", ""
-).strip()
-
-# GitHub Secret ထဲက \n ကို newline အဖြစ် ပြောင်းခြင်း
-FIREBASE_PRIVATE_KEY = FIREBASE_PRIVATE_KEY.replace(
-    "\\n", "\n"
-).strip()
+# GitHub/Render Secret ထဲက \n ကို newline အဖြစ် ပြောင်းခြင်း
+FIREBASE_PRIVATE_KEY = FIREBASE_PRIVATE_KEY.replace("\\n", "\n").strip()
 
 # Secret ကို quotation marks နဲ့ ထည့်ထားမိရင် ဖယ်ခြင်း
 if (
@@ -47,19 +36,11 @@ if (
 ):
     FIREBASE_PRIVATE_KEY = FIREBASE_PRIVATE_KEY[1:-1]
 
-TELEGRAM_API = (
-    f"https://api.telegram.org/bot{BOT_TOKEN}"
-)
-
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
-
-FCM_SCOPE = (
-    "https://www.googleapis.com/auth/firebase.messaging"
-)
-
+FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging"
 
 user_states = {}
-
 polling_started = False
 polling_lock = threading.Lock()
 
@@ -67,7 +48,6 @@ polling_lock = threading.Lock()
 processed_update_ids = set()
 processed_update_lock = threading.Lock()
 MAX_PROCESSED_UPDATES = 2000
-
 
 
 # ==================================================
@@ -84,9 +64,7 @@ def is_admin(user_id):
 
 def telegram(method, data=None, timeout=20):
     if not BOT_TOKEN:
-        raise RuntimeError(
-            "GitHub Secret TELEGRAM_BOT_TOKEN မရှိပါ။"
-        )
+        raise RuntimeError("TELEGRAM_BOT_TOKEN မရှိပါ။")
 
     response = requests.post(
         f"{TELEGRAM_API}/{method}",
@@ -101,14 +79,8 @@ def telegram(method, data=None, timeout=20):
         raise RuntimeError("Telegram မှ JSON တုံ့ပြန်ချက် မရပါ။")
 
     if not response.ok or not result.get("ok"):
-        description = result.get(
-            "description",
-            response.text[:1000]
-        )
-        raise RuntimeError(
-            f"Telegram API Error ({response.status_code}): "
-            f"{description}"
-        )
+        description = result.get("description", response.text[:1000])
+        raise RuntimeError(f"Telegram API Error ({response.status_code}): {description}")
 
     return result.get("result")
 
@@ -118,10 +90,8 @@ def send_message(chat_id, text, keyboard=None):
         "chat_id": chat_id,
         "text": str(text)[:4000]
     }
-
     if keyboard:
         data["reply_markup"] = keyboard
-
     return telegram("sendMessage", data)
 
 
@@ -129,20 +99,11 @@ def main_menu():
     return {
         "inline_keyboard": [
             [
-                {
-                    "text": "📊 စနစ်အခြေအနေ",
-                    "callback_data": "status"
-                },
-                {
-                    "text": "➕ Noti အသစ်ပို့ရန်",
-                    "callback_data": "create"
-                }
+                {"text": "📊 စနစ်အခြေအနေ", "callback_data": "status"},
+                {"text": "➕ Noti အသစ်ပို့ရန်", "callback_data": "create"}
             ],
             [
-                {
-                    "text": "❌ လုပ်ဆောင်ချက် ပယ်ဖျက်ရန်",
-                    "callback_data": "cancel"
-                }
+                {"text": "❌ လုပ်ဆောင်ချက် ပယ်ဖျက်ရန်", "callback_data": "cancel"}
             ]
         ]
     }
@@ -154,29 +115,17 @@ def main_menu():
 
 def get_fb_access_token():
     if not FIREBASE_CLIENT_EMAIL:
-        raise RuntimeError(
-            "FIREBASE_CLIENT_EMAIL Secret မရှိပါ။"
-        )
-
+        raise RuntimeError("FIREBASE_CLIENT_EMAIL Secret မရှိပါ။")
     if not FIREBASE_PRIVATE_KEY:
-        raise RuntimeError(
-            "FIREBASE_PRIVATE_KEY Secret မရှိပါ။"
-        )
+        raise RuntimeError("FIREBASE_PRIVATE_KEY Secret မရှိပါ။")
 
     if (
-        "-----BEGIN PRIVATE KEY-----"
-        not in FIREBASE_PRIVATE_KEY
-        or "-----END PRIVATE KEY-----"
-        not in FIREBASE_PRIVATE_KEY
+        "-----BEGIN PRIVATE KEY-----" not in FIREBASE_PRIVATE_KEY
+        or "-----END PRIVATE KEY-----" not in FIREBASE_PRIVATE_KEY
     ):
-        raise RuntimeError(
-            "FIREBASE_PRIVATE_KEY ပုံစံမမှန်ပါ။ "
-            "Service Account JSON ထဲက private_key "
-            "တန်ဖိုးကို အပြည့်အစုံ ထည့်ထားကြောင်း စစ်ပါ။"
-        )
+        raise RuntimeError("FIREBASE_PRIVATE_KEY ပုံစံမမှန်ပါ။")
 
     now = int(time.time())
-
     payload = {
         "iss": FIREBASE_CLIENT_EMAIL,
         "scope": FCM_SCOPE,
@@ -186,72 +135,42 @@ def get_fb_access_token():
     }
 
     try:
-        signed_jwt = jwt.encode(
-            payload,
-            FIREBASE_PRIVATE_KEY,
-            algorithm="RS256"
-        )
+        signed_jwt = jwt.encode(payload, FIREBASE_PRIVATE_KEY, algorithm="RS256")
     except Exception as e:
-        raise RuntimeError(
-            "Firebase Private Key ဖြင့် JWT "
-            f"လက်မှတ်ထိုးမရပါ။ Key ကို စစ်ပါ။ ({e})"
-        ) from e
+        raise RuntimeError(f"Firebase Private Key ဖြင့် JWT လက်မှတ်ထိုးမရပါ: {e}")
 
     try:
         response = requests.post(
             OAUTH_TOKEN_URL,
             data={
-                "grant_type":
-                    "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
                 "assertion": signed_jwt
             },
             timeout=30
         )
     except requests.RequestException as e:
-        raise RuntimeError(
-            f"Google OAuth server သို့ ချိတ်ဆက်မရပါ: {e}"
-        ) from e
+        raise RuntimeError(f"Google OAuth server သို့ ချိတ်ဆက်မရပါ: {e}")
 
     if not response.ok:
-        # Access token သို့မဟုတ် private key ကို log မထုတ်ပါ
         try:
             detail = response.json()
         except ValueError:
             detail = response.text[:1000]
+        raise RuntimeError(f"Firebase OAuth Error HTTP {response.status_code}: {detail}")
 
-        raise RuntimeError(
-            f"Firebase OAuth Error HTTP {response.status_code}: "
-            f"{detail}"
-        )
-
-    token_data = response.json()
-    access_token = token_data.get("access_token")
-
-    if not access_token:
-        raise RuntimeError(
-            "Google OAuth မှ Access Token မရရှိပါ။"
-        )
-
-    return access_token
+    return response.json().get("access_token")
 
 
 # ==================================================
-# FIREBASE CLOUD MESSAGING HTTP V1
+# FIREBASE CLOUD MESSAGING HTTP V1 (လူကြီးမင်းပေးသော လိပ်စာအမှန်)
 # ==================================================
 
 def send_fcm_notification(title, message):
     if not FIREBASE_PROJECT_ID:
-        raise RuntimeError(
-            "FIREBASE_PROJECT_ID Secret မရှိပါ။"
-        )
+        raise RuntimeError("FIREBASE_PROJECT_ID Secret မရှိပါ။")
 
     access_token = get_fb_access_token()
-
-    # မှန်ကန်သော Firebase FCM HTTP v1 endpoint
-    url = (
-        "https://fcm.googleapis.com/v1/projects/"
-        f"{FIREBASE_PROJECT_ID}/messages:send"
-    )
+    url = f"https://fcm.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/messages:send"
 
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -269,42 +188,18 @@ def send_fcm_notification(title, message):
     }
 
     try:
-        response = requests.post(
-            url,
-            json=body,
-            headers=headers,
-            timeout=30
-        )
+        response = requests.post(url, json=body, headers=headers, timeout=30)
     except requests.RequestException as e:
-        raise RuntimeError(
-            f"FCM server သို့ ချိတ်ဆက်မရပါ: {e}"
-        ) from e
+        raise RuntimeError(f"FCM server သို့ ချိတ်ဆက်မရပါ: {e}")
 
     if not response.ok:
         try:
             error_data = response.json()
         except ValueError:
             error_data = response.text[:1500]
+        raise RuntimeError(f"Firebase FCM Error HTTP {response.status_code}: {error_data}")
 
-        logging.error(
-            "FCM HTTP %s: %s",
-            response.status_code,
-            error_data
-        )
-
-        raise RuntimeError(
-            f"Firebase FCM Error HTTP {response.status_code}: "
-            f"{error_data}"
-        )
-
-    result = response.json()
-
-    logging.info(
-        "FCM accepted message: %s",
-        result.get("name", "unknown")
-    )
-
-    return result
+    return response.json()
 
 
 # ==================================================
@@ -313,88 +208,66 @@ def send_fcm_notification(title, message):
 
 def handle_callback(update):
     query = update.get("callback_query", {})
-
     if not query:
         return
 
     data = query.get("data", "")
     user = query.get("from", {})
     user_id = user.get("id")
-
-    chat_id = (
-        query.get("message", {})
-        .get("chat", {})
-        .get("id")
-    )
+    chat_id = query.get("message", {}).get("chat", {}).get("id")
 
     try:
-        telegram("answerCallbackQuery", {
-            "callback_query_id": query["id"]
-        })
+        telegram("answerCallbackQuery", {"callback_query_id": query["id"]})
     except Exception:
         logging.exception("Callback acknowledgement failed")
 
     if not is_admin(user_id):
         if chat_id:
-            send_message(
-                chat_id,
-                "⛔ Admin သာ အသုံးပြုနိုင်ပါတယ်။"
-            )
+            send_message(chat_id, "⛔ Admin သာ အသုံးပြုနိုင်ပါတယ်။")
         return
 
     if not chat_id:
         return
 
     try:
-        if data == "menu":
-            send_message(
-                chat_id,
-                "⚙️ Admin Menu",
-                main_menu()
-            )
-
-        elif data == "cancel":
+        if data == "cancel":
             user_states.pop(str(user_id), None)
-
-            send_message(
-                chat_id,
-                "လုပ်ဆောင်ချက် ပယ်ဖျက်ပြီးပါပြီ။",
-                main_menu()
-            )
-
+            send_message(chat_id, "❌ လုပ်ဆောင်ချက်ကို ပယ်ဖျက်ပြီးပါပြီ။", main_menu())
+        
         elif data == "status":
             send_message(
                 chat_id,
-                "📊 စနစ်အခြေအနေ\n\n"
-                "🟢 Telegram Backend: အလုပ်လုပ်နေသည်\n"
-                "ℹ️ Firebase ပို့ဆောင်မှုကို စမ်းသပ်မှသာ "
-                "အမှန်တကယ် အခြေအနေ သိနိုင်ပါမည်။",
+                "📊 စနစ်အခြေအနေ\n\n🟢 Backend: Active (Render Server)\n🟢 Firebase FCM: ချိတ်ဆက်မှု အဆင်သင့်ရှိသည်",
                 main_menu()
             )
-
+            
         elif data == "create":
-            user_states[str(user_id)] = {
-                "step": "title"
-            }
-
-            send_message(
-                chat_id,
-                "➕ Push Notification အသစ်ပို့မယ်။\n\n"
-                "Notification Title ကို ရိုက်ပို့ပါ။\n"
-                "ပယ်ဖျက်ရန် /cancel ကို ရိုက်ပါ။"
-            )
+            user_states[str(user_id)] = {"step": "title"}
+            send_message(chat_id, "➕ Push Notification အသစ်ဆောက်ပါမယ်။\n\nအရင်ဆုံး Notification **Title (ခေါင်းစဉ်)** ကို ရိုက်ပို့ပေးပါ။")
+            
+        elif data == "confirm_send":
+            state = user_states.get(str(user_id))
+            if state and state.get("step") == "confirm":
+                title = state["title"]
+                message = state["message"]
+                user_states.pop(str(user_id), None)
+                
+                send_message(chat_id, "⏳ Firebase FCM သို့ တိုက်ရိုက်တွန်းပို့နေပါသည်...")
+                try:
+                    send_fcm_notification(title, message)
+                    send_message(chat_id, f"🚀 **အောင်မြင်စွာ ပို့ဆောင်ပြီးပါပြီ။**\n\n📌 Title: {title}\n📝 Message: {message}", main_menu())
+                except Exception as e:
+                    send_message(chat_id, f"❌ ပို့ဆောင်မှု မအောင်မြင်ပါ- {str(e)}", main_menu())
+            else:
+                send_message(chat_id, "❌ သက်တမ်းကုန်ဆုံးသွားသော လုပ်ဆောင်ချက်ဖြစ်သည် သို့မဟုတ် ဒေတာမရှိပါ။", main_menu())
+                
+        elif data == "re_create":
+            user_states[str(user_id)] = {"step": "title"}
+            send_message(chat_id, "➕ ပြန်လည်ပြင်ဆင်ရေးသားပါမယ်။\n\nNotification **Title (ခေါင်းစဉ်)** ကို ပြန်လည်ရိုက်ပို့ပေးပါ။")
 
     except Exception as e:
-        logging.exception("Callback handler error")
-
-        try:
-            send_message(
-                chat_id,
-                f"❌ အမှားအယွင်း: {str(e)[:1500]}",
-                main_menu()
-            )
-        except Exception:
-            logging.exception("Could not send callback error")
+        logging.exception("Callback handling error")
+        send_message(chat_id, f"❌ အမှားအယွင်းရှိခဲ့သည်- {str(e)}", main_menu())
 
 
 # ==================================================
@@ -411,201 +284,85 @@ def handle_message(update):
     if not is_admin(user_id) or not chat_id:
         return
 
-    if text in ("/start", "/menu"):
+    if text == "/start" or text == "/menu":
         user_states.pop(str(user_id), None)
-
-        send_message(
-            chat_id,
-            "⚙️ Admin Panel မှ ကြိုဆိုပါတယ်။",
-            main_menu()
-        )
+        send_message(chat_id, "⚙️ Admin Control Panel မှ ကြိုဆိုပါတယ်။", main_menu())
         return
 
     if text == "/cancel":
         user_states.pop(str(user_id), None)
-
-        send_message(
-            chat_id,
-            "လုပ်ဆောင်ချက် ပယ်ဖျက်ပြီးပါပြီ။",
-            main_menu()
-        )
+        send_message(chat_id, "❌ လုပ်ဆောင်ချက်ကို ပယ်ဖျက်ပြီးပါပြီ။", main_menu())
         return
 
     state = user_states.get(str(user_id))
+    if state:
+        if state["step"] == "title":
+            user_states[str(user_id)] = {"step": "message", "title": text}
+            send_message(chat_id, f"📌 **Title:** {text}\n\nနောက်တစ်ဆင့်အနေနဲ့ Notification **Message (စာသား)** ကို ဆက်လက်ရိုက်ပို့ပေးပါ။")
+            
+        elif state["step"] == "message":
+            title = state["title"]
+            msg_body = text
+            user_states[str(user_id)] = {"step": "confirm", "title": title, "message": msg_body}
+            
+            # သေချာပါသလား ဟု မေးမြန်းသည့် ကီးဘုတ်ခလုတ်
+            confirm_keyboard = {
+                "inline_keyboard": [
+                    [
+{"text": "✅ သေချာသည်၊ အခုပို့မယ်", "callback_data": "confirm_send"},
+{"text": "✏️ ပြန်ပြင်မယ်", "callback_data": "re_create"}
+],
+[
+{"text": "❌ ဖျက်သိမ်းမယ်", "callback_data": "cancel"}
+]
+]
+}
+send_message(
+chat_id,
+f"❓ ယခုအချက်အလက်များအတိုင်း ပို့ရန် သေချာပါသလား။\n\n📌 Title: {title}\n📝 Message: {msg_body}",
+confirm_keyboard
+)
 
-    if not state:
-        return
-
-    if not text:
-        send_message(
-            chat_id,
-            "စာသားကို ရိုက်ပို့ပေးပါ။"
-        )
-        return
-
-    if state["step"] == "title":
-        user_states[str(user_id)] = {
-            "step": "message",
-            "title": text
-        }
-
-        send_message(
-            chat_id,
-            f"📌 Title: {text}\n\n"
-            "ယခု Notification Message ကို ရိုက်ပို့ပါ။"
-        )
-        return
-
-    if state["step"] == "message":
-        title = state["title"]
-        msg_body = text
-
-        user_states.pop(str(user_id), None)
-
-        send_message(
-            chat_id,
-            "⏳ Firebase သို့ Notification ပို့နေပါသည်..."
-        )
-
-        try:
-            result = send_fcm_notification(
-                title,
-                msg_body
-            )
-
-            send_message(
-                chat_id,
-                "🚀 Firebase က Notification ကို "
-                "ပို့ရန် လက်ခံပြီးပါပြီ။\n\n"
-                f"📌 Title: {title}\n"
-                f"📝 Message: {msg_body}\n\n"
-                "မှတ်ချက်: Firebase လက်ခံခြင်းသည် "
-                "စက်အားလုံးသို့ ရောက်ရှိပြီးကြောင်း "
-                "အာမခံခြင်းမဟုတ်ပါ။",
-                main_menu()
-            )
-
-        except Exception as e:
-            logging.exception("FCM send failed")
-
-            try:
-                send_message(
-                    chat_id,
-                    "❌ Firebase Notification ပို့မရပါ။\n\n"
-                    f"အမှား: {str(e)[:2500]}",
-                    main_menu()
-                )
-            except Exception:
-                logging.exception("Could not send FCM error reply")
+==================================================
 
 
-# ==================================================
-# TELEGRAM LONG POLLING
-# ==================================================
+TELEGRAM POLLING LOOP
+
+
+==================================================
 
 def telegram_polling():
-    global polling_started
-
-    with polling_lock:
-        if polling_started:
-            return
-        polling_started = True
-
-    offset = 0
-    logging.info("Telegram polling started")
-
-    while True:
-        try:
-            updates = telegram(
-                "getUpdates",
-                {
-                    "offset": offset,
-                    "timeout": 10,
-                    "allowed_updates": [
-                        "message",
-                        "callback_query"
-                    ]
-                },
-                timeout=20
-            )
-
-            
+global polling_started
+with polling_lock:
+if polling_started:
+return
+polling_started = True
+offset = 0
+logging.info("Telegram Polling Engine Started...")
+while True:
+try:
+updates = telegram("getUpdates", {"offset": offset, "timeout": 15}, timeout=25)
 for update in updates:
-    update_id = update.get("update_id")
-
-    if update_id is None:
-        continue
-
-    offset = update_id + 1
-
-    with processed_update_lock:
-        if update_id in processed_update_ids:
-            logging.info(
-                "Duplicate update skipped: %s",
-                update_id
-            )
-            continue
-
-        processed_update_ids.add(update_id)
-
-        if len(processed_update_ids) > MAX_PROCESSED_UPDATES:
-            processed_update_ids.clear()
-            processed_update_ids.add(update_id)
-
-    try:
-        if "callback_query" in update:
-            handle_callback(update)
-        elif "message" in update:
-            handle_message(update)
-
-    except Exception:
-        logging.exception("Update handler error")
-
-
-        except Exception:
-            logging.exception("Telegram polling error")
-            time.sleep(3)
-
-
-# ==================================================
-# FLASK HEALTH CHECK
-# ==================================================
-
-@app.route("/")
+update_id = update["update_id"]
+offset = update_id + 1
+with processed_update_lock:
+if update_id in processed_update_ids:
+continue
+processed_update_ids.add(update_id)
+if len(processed_update_ids) > MAX_PROCESSED_UPDATES:
+processed_update_ids.pop()
+if "callback_query" in update:
+handle_callback(update)
+elif "message" in update:
+handle_message(update)
+except Exception as e:
+logging.error(f"Polling Network Exception: {e}")
+time.sleep(3)
+@app.route('/')
 def index():
-    return jsonify({
-        "status": "running",
-        "bot": "active",
-        "firebase_configured": bool(
-            FIREBASE_PROJECT_ID
-            and FIREBASE_CLIENT_EMAIL
-            and FIREBASE_PRIVATE_KEY
-        )
-    })
-
-
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok"}), 200
-
-
-# ==================================================
-# START APPLICATION
-# ==================================================
-
-if __name__ == "__main__":
-    if not BOT_TOKEN:
-        logging.error("TELEGRAM_BOT_TOKEN Secret မရှိပါ။")
-
-    threading.Thread(
-        target=telegram_polling,
-        daemon=True
-    ).start()
-
-    port = int(os.environ.get("PORT", "8080"))
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        threaded=True
-    )
+return jsonify({"status": "healthy", "engine": "render_active"})
+if name == "main":
+if not polling_started:
+threading.Thread(target=telegram_polling, daemon=True).start()
+port = int(os.environ.get("PORT", 10000))
+app.run(host='0.0.0.0', port=port)
