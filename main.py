@@ -15,10 +15,6 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s"
 )
 
-# ==================================================
-# ENVIRONMENT VARIABLES
-# ==================================================
-
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
 
@@ -48,22 +44,21 @@ if (
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
-# FCM နှင့် Realtime Database အတွက် OAuth scopes
 FIREBASE_SCOPES = (
     "https://www.googleapis.com/auth/firebase.messaging "
     "https://www.googleapis.com/auth/firebase.database"
 )
 
 user_states = {}
+sending_users = set()
+sending_users_lock = threading.Lock()
 
 polling_started = False
 polling_lock = threading.Lock()
 
-sending_users = set()
-sending_users_lock = threading.Lock()
 
 # ==================================================
-# COMMON HELPERS
+# TELEGRAM HELPERS
 # ==================================================
 
 def is_admin(user_id):
@@ -88,12 +83,12 @@ def telegram(method, data=None, timeout=25):
         result = response.json()
     except ValueError:
         response.raise_for_status()
-        raise RuntimeError("Telegram JSON response မရပါ။")
+        raise RuntimeError("Telegram response မမှန်ပါ။")
 
     if not response.ok or not result.get("ok"):
         raise RuntimeError(
-            f"Telegram API Error ({response.status_code}): "
-            f"{result.get('description', response.text[:1000])}"
+            f"Telegram API Error {response.status_code}: "
+            f"{result.get('description', response.text[:800])}"
         )
 
     return result.get("result")
@@ -115,32 +110,17 @@ def main_menu():
     return {
         "inline_keyboard": [
             [
-                {
-                    "text": "📊 စနစ်အခြေအနေ",
-                    "callback_data": "status"
-                },
-                {
-                    "text": "➕ Noti အသစ်ပို့ရန်",
-                    "callback_data": "create"
-                }
+                {"text": "📊 စနစ်အခြေအနေ", "callback_data": "status"},
+                {"text": "➕ Noti ပို့ရန်", "callback_data": "create"}
             ],
             [
-                {
-                    "text": "🔔 နောက်ဆုံး Noti ကြည့်ရန်",
-                    "callback_data": "last_notification"
-                }
+                {"text": "🔔 နောက်ဆုံး Noti", "callback_data": "last"}
             ],
             [
-                {
-                    "text": "🗑️ Noti မှတ်တမ်းဖျက်ရန်",
-                    "callback_data": "delete_last"
-                }
+                {"text": "🗑️ မှတ်တမ်းဖျက်ရန်", "callback_data": "delete"}
             ],
             [
-                {
-                    "text": "❌ ပယ်ဖျက်ရန်",
-                    "callback_data": "cancel"
-                }
+                {"text": "❌ ပယ်ဖျက်ရန်", "callback_data": "cancel"}
             ]
         ]
     }
@@ -150,23 +130,14 @@ def confirm_menu():
     return {
         "inline_keyboard": [
             [
-                {
-                    "text": "✅ အခုပို့မယ်",
-                    "callback_data": "confirm_send"
-                },
-                {
-                    "text": "✏️ ပြန်ပြင်မယ်",
-                    "callback_data": "re_create"
-                }
+                {"text": "✅ အခုပို့မယ်", "callback_data": "confirm_send"},
+                {"text": "✏️ ပြန်ပြင်မယ်", "callback_data": "re_create"}
             ],
             [
-                {
-                    "text": "❌ ဖျက်သိမ်းမယ်",
-                    "callback_data": "cancel"
-                }
+                {"text": "❌ မပို့တော့ပါ", "callback_data": "cancel"}
             ]
         ]
-    ]
+    }
 
 
 def delete_confirm_menu():
@@ -175,21 +146,18 @@ def delete_confirm_menu():
             [
                 {
                     "text": "🗑️ ဖျက်ရန် အတည်ပြုမယ်",
-                    "callback_data": "confirm_delete_last"
+                    "callback_data": "confirm_delete"
                 }
             ],
             [
-                {
-                    "text": "↩️ မဖျက်တော့ပါ",
-                    "callback_data": "cancel"
-                }
+                {"text": "↩️ မဖျက်တော့ပါ", "callback_data": "cancel"}
             ]
         ]
     }
 
 
 # ==================================================
-# FIREBASE ACCESS TOKEN
+# FIREBASE AUTHENTICATION
 # ==================================================
 
 def get_fb_access_token():
@@ -233,8 +201,8 @@ def get_fb_access_token():
 
     if not response.ok:
         raise RuntimeError(
-            f"Google OAuth HTTP {response.status_code}: "
-            f"{response.text[:1200]}"
+            f"Google OAuth {response.status_code}: "
+            f"{response.text[:1000]}"
         )
 
     token = response.json().get("access_token")
@@ -253,15 +221,14 @@ def database_request(method, path, data=None):
     if not FIREBASE_DATABASE_URL:
         raise RuntimeError("FIREBASE_DATABASE_URL မရှိပါ။")
 
-    access_token = get_fb_access_token()
-
+    token = get_fb_access_token()
     url = f"{FIREBASE_DATABASE_URL}/{path}.json"
 
     response = requests.request(
         method,
         url,
         headers={
-            "Authorization": f"Bearer {access_token}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
         },
         json=data,
@@ -271,10 +238,10 @@ def database_request(method, path, data=None):
     if not response.ok:
         raise RuntimeError(
             f"Firebase Database HTTP {response.status_code}: "
-            f"{response.text[:1200]}"
+            f"{response.text[:1000]}"
         )
 
-    if response.status_code == 204 or not response.content:
+    if not response.content or response.status_code == 204:
         return None
 
     return response.json()
@@ -314,31 +281,26 @@ def delete_last_notification():
 def format_last_notification(record):
     if not isinstance(record, dict) or not record:
         return (
-            "🔔 နောက်ဆုံး Noti မှတ်တမ်း မရှိသေးပါ။\n\n"
-            "Noti တစ်ခု အောင်မြင်စွာပို့ပြီးမှ မှတ်တမ်းသိမ်းပါမယ်။"
+            "🔔 နောက်ဆုံး Noti မှတ်တမ်း မရှိသေးပါ။"
         )
-
-    title = str(record.get("title", "မရှိပါ"))
-    message = str(record.get("message", "မရှိပါ"))
-    sent_at = str(record.get("sent_at", "မသိရပါ"))
 
     return (
         "🔔 နောက်ဆုံးပို့ခဲ့သော Noti\n\n"
-        f"📌 Title: {title}\n"
-        f"📝 Message: {message}\n"
-        f"🕒 ပို့ချိန် (UTC): {sent_at}"
+        f"📌 Title: {record.get('title', '')}\n"
+        f"📝 Message: {record.get('message', '')}\n"
+        f"🕒 ပို့ချိန် UTC: {record.get('sent_at', '')}"
     )
 
 
 # ==================================================
-# FIREBASE FCM
+# FIREBASE CLOUD MESSAGING
 # ==================================================
 
 def send_fcm_notification(title, message):
     if not FIREBASE_PROJECT_ID:
         raise RuntimeError("FIREBASE_PROJECT_ID မရှိပါ။")
 
-    access_token = get_fb_access_token()
+    token = get_fb_access_token()
 
     url = (
         "https://fcm.googleapis.com/v1/projects/"
@@ -357,7 +319,7 @@ def send_fcm_notification(title, message):
             }
         },
         headers={
-            "Authorization": f"Bearer {access_token}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
         },
         timeout=30
@@ -366,31 +328,25 @@ def send_fcm_notification(title, message):
     if not response.ok:
         raise RuntimeError(
             f"FCM HTTP {response.status_code}: "
-            f"{response.text[:1500]}"
+            f"{response.text[:1200]}"
         )
 
     return response.json()
 
 
 # ==================================================
-# TELEGRAM CALLBACK HANDLER
+# CALLBACK HANDLER
 # ==================================================
 
 def handle_callback(update):
     query = update.get("callback_query", {})
-
     if not query:
         return
 
     query_id = query.get("id")
     data = query.get("data", "")
     user_id = query.get("from", {}).get("id")
-
-    chat_id = (
-        query.get("message", {})
-        .get("chat", {})
-        .get("id")
-    )
+    chat_id = query.get("message", {}).get("chat", {}).get("id")
 
     try:
         telegram(
@@ -414,62 +370,57 @@ def handle_callback(update):
         if data == "status":
             try:
                 record = get_last_notification()
+                status_text = "🟢 Firebase Database ချိတ်ဆက်မှု အောင်မြင်"
                 last_text = format_last_notification(record)
-                db_status = "🟢 Database ချိတ်ဆက်မှု အောင်မြင်"
-            except Exception as e:
-                logging.exception("Database status check failed")
-                last_text = "⚠️ နောက်ဆုံး Noti မှတ်တမ်းကို ဖတ်မရပါ။"
-                db_status = f"🔴 Database အမှား: {str(e)[:500]}"
+            except Exception as exc:
+                logging.exception("Database status failed")
+                status_text = f"🔴 Database အမှား: {str(exc)[:500]}"
+                last_text = ""
 
             send_message(
                 chat_id,
                 "📊 စနစ်အခြေအနေ\n\n"
-                "🟢 Telegram Backend: အလုပ်လုပ်နေသည်\n"
-                f"{db_status}\n\n"
-                f"{last_text}",
+                "🟢 Telegram Backend အလုပ်လုပ်နေသည်\n"
+                f"{status_text}\n\n{last_text}",
                 main_menu()
             )
 
-        elif data == "last_notification":
-            record = get_last_notification()
-
+        elif data == "last":
             send_message(
                 chat_id,
-                format_last_notification(record),
+                format_last_notification(get_last_notification()),
                 main_menu()
             )
 
-        elif data == "delete_last":
+        elif data == "delete":
             record = get_last_notification()
 
             if not isinstance(record, dict) or not record:
                 send_message(
                     chat_id,
-                    "ℹ️ ဖျက်ရန် Noti မှတ်တမ်း မရှိပါ။",
+                    "ℹ️ ဖျက်ရန် မှတ်တမ်းမရှိပါ။",
                     main_menu()
                 )
                 return
 
-            user_states[user_key] = {
-                "step": "delete_last_confirm"
-            }
+            user_states[user_key] = {"step": "delete_confirm"}
 
             send_message(
                 chat_id,
                 "⚠️ နောက်ဆုံး Noti မှတ်တမ်းကို ဖျက်မှာ သေချာပါသလား။\n\n"
                 f"{format_last_notification(record)}\n\n"
-                "မှတ်ချက်: Database မှတ်တမ်းကိုသာ ဖျက်ပါမယ်။ "
-                "ဖုန်းတွေမှာ ရောက်ပြီးသား Noti ကို ပြန်ဖျက်မှာ မဟုတ်ပါ။",
+                "Database မှတ်တမ်းကိုသာ ဖျက်ပါမယ်။ "
+                "ဖုန်းမှာ ရောက်ပြီးသား Noti ကို ပြန်ဖျက်မှာ မဟုတ်ပါ။",
                 delete_confirm_menu()
             )
 
-        elif data == "confirm_delete_last":
-            state = user_states.get(user_key)
+        elif data == "confirm_delete":
+            state = user_states.get(user_key, {})
 
-            if not state or state.get("step") != "delete_last_confirm":
+            if state.get("step") != "delete_confirm":
                 send_message(
                     chat_id,
-                    "ℹ️ ဖျက်ရန် အတည်ပြုချက်မရှိပါ။ Menu ကနေ ပြန်ရွေးပါ။",
+                    "ℹ️ ဖျက်ရန် အတည်ပြုချက်မရှိပါ။",
                     main_menu()
                 )
                 return
@@ -479,39 +430,36 @@ def handle_callback(update):
 
             send_message(
                 chat_id,
-                "🗑️ နောက်ဆုံး Noti မှတ်တမ်းကို ဖျက်ပြီးပါပြီ။",
+                "🗑️ Noti မှတ်တမ်းကို ဖျက်ပြီးပါပြီ။",
                 main_menu()
             )
 
         elif data == "create":
             user_states[user_key] = {"step": "title"}
-
             send_message(
                 chat_id,
-                "➕ Notification အသစ်ပြုလုပ်ပါမယ်။\n\n"
+                "➕ Noti အသစ်ပြုလုပ်ပါမယ်။\n\n"
                 "Notification Title ကို ရိုက်ပို့ပါ။\n"
-                "ပယ်ဖျက်ရန် /cancel ကို ရိုက်ပါ။"
+                "/cancel ဖြင့် ပယ်ဖျက်နိုင်ပါတယ်။"
             )
 
         elif data == "cancel":
             user_states.pop(user_key, None)
-
             send_message(
                 chat_id,
-                "❌ လုပ်ဆောင်ချက်ကို ပယ်ဖျက်ပြီးပါပြီ။",
+                "❌ ပယ်ဖျက်ပြီးပါပြီ။",
                 main_menu()
             )
 
         elif data == "re_create":
             user_states[user_key] = {"step": "title"}
-
             send_message(
                 chat_id,
-                "✏️ ပြန်လည်ရေးသားပါမယ်။\n\n"
-                "Notification Title အသစ်ကို ရိုက်ပို့ပါ။"
+                "✏️ Title အသစ်ကို ရိုက်ပို့ပါ။"
             )
 
         elif data == "confirm_send":
+            # ခလုတ်ကို နှစ်ခါနှိပ်လျှင် တစ်ခါသာ ပို့မည်
             with sending_users_lock:
                 if user_key in sending_users:
                     return
@@ -527,65 +475,52 @@ def handle_callback(update):
             if not state:
                 send_message(
                     chat_id,
-                    "ℹ️ ပို့ရန်အချက်အလက် မရှိတော့ပါ။ "
-                    "Menu ကနေ အသစ်ပြုလုပ်ပါ။",
+                    "ℹ️ ပို့ရန်အချက်အလက် မရှိတော့ပါ။",
                     main_menu()
                 )
                 return
 
-            title = state["title"]
-            msg_body = state["message"]
-
             try:
+                title = state["title"]
+                body = state["message"]
+
                 send_message(
                     chat_id,
-                    "⏳ Firebase သို့ Notification ပို့နေပါသည်..."
+                    "⏳ Notification ပို့နေပါသည်..."
                 )
 
-                # FCM အောင်မြင်မှသာ မှတ်တမ်းသိမ်းမည်
-                fcm_result = send_fcm_notification(title, msg_body)
+                result = send_fcm_notification(title, body)
 
                 try:
                     save_last_notification(
                         title,
-                        msg_body,
-                        fcm_result.get("name", "")
+                        body,
+                        result.get("name", "")
                     )
-
-                    history_status = (
-                        "💾 နောက်ဆုံး Noti မှတ်တမ်း သိမ်းပြီးပါပြီ။"
-                    )
-
-                except Exception as db_error:
-                    logging.exception(
-                        "FCM succeeded but history save failed"
-                    )
-
-                    history_status = (
-                        "⚠️ Noti ကို Firebase FCM က လက်ခံပြီးပါပြီ။\n"
-                        "သို့သော် Database မှတ်တမ်းသိမ်းမရပါ။\n"
-                        f"အမှား: {str(db_error)[:500]}"
+                    history_text = "💾 Noti မှတ်တမ်း သိမ်းပြီးပါပြီ။"
+                except Exception as exc:
+                    logging.exception("History save failed")
+                    history_text = (
+                        "⚠️ Noti ပို့ရန် FCM က လက်ခံပြီးပါပြီ။\n"
+                        "Database မှတ်တမ်းသိမ်းမရပါ။\n"
+                        f"{str(exc)[:500]}"
                     )
 
                 send_message(
                     chat_id,
-                    "🚀 Firebase FCM က Notification ကို "
-                    "ပို့ရန် လက်ခံပြီးပါပြီ။\n\n"
+                    "🚀 FCM က Notification ကို ပို့ရန် လက်ခံပြီးပါပြီ။\n\n"
                     f"📌 Title: {title}\n"
-                    f"📝 Message: {msg_body}\n\n"
-                    f"{history_status}\n\n"
-                    "မှတ်ချက်: ဖုန်းအားလုံးသို့ ရောက်ရှိကြောင်း "
-                    "အာမခံခြင်းမဟုတ်ပါ။",
+                    f"📝 Message: {body}\n\n"
+                    f"{history_text}\n\n"
+                    "မှတ်ချက်: ဖုန်းအားလုံးသို့ ရောက်ရှိကြောင်း အာမခံခြင်းမဟုတ်ပါ။",
                     main_menu()
                 )
 
-            except Exception as e:
-                logging.exception("FCM notification failed")
-
+            except Exception as exc:
+                logging.exception("Notification send failed")
                 send_message(
                     chat_id,
-                    "❌ Notification ပို့မရပါ။\n\n"
-                    f"အမှား: {str(e)[:1500]}",
+                    f"❌ Noti ပို့မရပါ။\n\n{str(exc)[:1200]}",
                     main_menu()
                 )
 
@@ -593,21 +528,20 @@ def handle_callback(update):
                 with sending_users_lock:
                     sending_users.discard(user_key)
 
-    except Exception as e:
+    except Exception as exc:
         logging.exception("Callback handler error")
-
         try:
             send_message(
                 chat_id,
-                f"❌ အမှားအယွင်း: {str(e)[:1200]}",
+                f"❌ အမှားအယွင်း: {str(exc)[:1000]}",
                 main_menu()
             )
         except Exception:
-            logging.exception("Failed to send callback error")
+            logging.exception("Error reply failed")
 
 
 # ==================================================
-# TELEGRAM MESSAGE HANDLER
+# MESSAGE HANDLER
 # ==================================================
 
 def handle_message(update):
@@ -623,7 +557,6 @@ def handle_message(update):
 
     if text in ("/start", "/menu"):
         user_states.pop(user_key, None)
-
         send_message(
             chat_id,
             "⚙️ Admin Control Panel မှ ကြိုဆိုပါတယ်။",
@@ -633,16 +566,14 @@ def handle_message(update):
 
     if text == "/cancel":
         user_states.pop(user_key, None)
-
         send_message(
             chat_id,
-            "❌ လုပ်ဆောင်ချက်ကို ပယ်ဖျက်ပြီးပါပြီ။",
+            "❌ ပယ်ဖျက်ပြီးပါပြီ။",
             main_menu()
         )
         return
 
     state = user_states.get(user_key)
-
     if not state:
         return
 
@@ -655,7 +586,6 @@ def handle_message(update):
             "step": "message",
             "title": text
         }
-
         send_message(
             chat_id,
             f"📌 Title: {text}\n\n"
@@ -669,7 +599,6 @@ def handle_message(update):
             "title": state["title"],
             "message": text
         }
-
         send_message(
             chat_id,
             "❓ ဒီအချက်အလက်တွေအတိုင်း ပို့မှာ သေချာပါသလား။\n\n"
@@ -680,7 +609,7 @@ def handle_message(update):
 
 
 # ==================================================
-# TELEGRAM LONG POLLING
+# TELEGRAM POLLING
 # ==================================================
 
 def telegram_polling():
@@ -689,7 +618,6 @@ def telegram_polling():
     with polling_lock:
         if polling_started:
             return
-
         polling_started = True
 
     offset = 0
@@ -702,17 +630,13 @@ def telegram_polling():
                 {
                     "offset": offset,
                     "timeout": 15,
-                    "allowed_updates": [
-                        "message",
-                        "callback_query"
-                    ]
+                    "allowed_updates": ["message", "callback_query"]
                 },
                 timeout=25
             )
 
             for update in updates:
                 update_id = update.get("update_id")
-
                 if update_id is None:
                     continue
 
@@ -723,19 +647,16 @@ def telegram_polling():
                         handle_callback(update)
                     elif "message" in update:
                         handle_message(update)
-
                 except Exception:
                     logging.exception("Update handler error")
 
-        except Exception as e:
+        except Exception as exc:
             logging.exception("Telegram polling error")
 
-            # 409 ဆိုလျှင် အခြား process တစ်ခုလည်း
-            # ဒီ Bot Token နဲ့ polling လုပ်နေနိုင်သည်။
-            if "409" in str(e) or "Conflict" in str(e):
+            if "409" in str(exc) or "Conflict" in str(exc):
                 logging.error(
-                    "409 Conflict: stop other bot instances "
-                    "and GitHub Actions runners."
+                    "409 Conflict: stop other polling processes "
+                    "and GitHub Actions bot workflows."
                 )
                 time.sleep(10)
             else:
@@ -759,10 +680,7 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
-# ==================================================
-# START TELEGRAM POLLING
-# ==================================================
-
+# Start one polling thread per Python process.
 threading.Thread(
     target=telegram_polling,
     daemon=True,
@@ -771,10 +689,8 @@ threading.Thread(
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-
     app.run(
         host="0.0.0.0",
-        port=port,
+        port=int(os.environ.get("PORT", "10000")),
         threaded=True
     )
