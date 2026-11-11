@@ -1,6 +1,4 @@
 import os
-import time
-import json
 import logging
 import threading
 from datetime import datetime, timezone
@@ -8,7 +6,7 @@ from datetime import datetime, timezone
 import requests
 import firebase_admin
 from firebase_admin import credentials, messaging
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 # ================= CONFIG =================
 
@@ -22,6 +20,9 @@ FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")
 FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL", "")
 FIREBASE_PRIVATE_KEY = os.getenv("FIREBASE_PRIVATE_KEY", "").replace("\\n", "\n")
 
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SUPABASE_TABLE = f"{SUPABASE_URL}/rest/v1/notifications"
 
@@ -32,12 +33,12 @@ logging.basicConfig(
 
 app = Flask(__name__)
 
-# ================= GLOBAL STATE =================
-
 user_states = {}
 drafts = {}
-polling_started = False
-polling_lock = threading.Lock()
+
+# Prevent concurrent processing of duplicate update IDs.
+processed_updates = set()
+processed_lock = threading.Lock()
 
 # ================= FIREBASE =================
 
@@ -45,13 +46,11 @@ def init_firebase():
     if firebase_admin._apps:
         return
 
-    required = [
+    if not all([
         FIREBASE_PROJECT_ID,
         FIREBASE_CLIENT_EMAIL,
         FIREBASE_PRIVATE_KEY
-    ]
-
-    if not all(required):
+    ]):
         raise RuntimeError("Firebase environment variables are missing")
 
     service_account = {
@@ -62,8 +61,9 @@ def init_firebase():
         "token_uri": "https://oauth2.googleapis.com/token"
     }
 
-    cred = credentials.Certificate(service_account)
-    firebase_admin.initialize_app(cred)
+    firebase_admin.initialize_app(
+        credentials.Certificate(service_account)
+    )
 
 
 def send_fcm_notification(title, message):
@@ -129,18 +129,19 @@ def save_notification(title, message, status="sending"):
     )
 
     if not result:
-        raise RuntimeError("Supabase did not return the inserted record")
+        raise RuntimeError("Supabase did not return inserted record")
 
     return result[0]
 
 
 def update_notification(notification_id, data):
-    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    payload = dict(data)
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     return supabase_request(
         "PATCH",
         params={"id": f"eq.{notification_id}"},
-        data=data
+        data=payload
     )
 
 
@@ -170,6 +171,7 @@ def telegram(method, data=None):
         json=data or {},
         timeout=35
     )
+    response.raise_for_status()
 
     result = response.json()
 
@@ -192,10 +194,13 @@ def send_message(chat_id, text, keyboard=None):
 
 
 def answer_callback(callback_id, text=""):
-    telegram("answerCallbackQuery", {
-        "callback_query_id": callback_id,
-        "text": text
-    })
+    try:
+        telegram("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": text
+        })
+    except Exception:
+        logging.exception("Callback answer failed")
 
 
 def is_admin(update):
@@ -203,14 +208,14 @@ def is_admin(update):
 
     if "message" in update:
         user = update["message"].get("from", {})
-
     elif "callback_query" in update:
         user = update["callback_query"].get("from", {})
 
-    if not user:
-        return False
-
-    return str(user.get("id", "")) == ADMIN_ID
+    return bool(
+        ADMIN_ID
+        and user
+        and str(user.get("id", "")) == ADMIN_ID
+    )
 
 
 def main_keyboard():
@@ -236,15 +241,14 @@ def show_dashboard(chat_id):
 
         text = (
             "📊 NOTIFICATION DASHBOARD\n\n"
-            f"📦 Total: {len(records)}\n"
+            f"📦 Total (latest 100): {len(records)}\n"
             f"✅ Sent: {sent}\n"
             f"❌ Failed: {failed}\n\n"
             "Select an action below."
         )
-
     except Exception:
         logging.exception("Dashboard error")
-        text = "⚠️ Supabase connection error."
+        text = "⚠️ Could not load Supabase dashboard."
 
     send_message(chat_id, text, main_keyboard())
 
@@ -256,8 +260,7 @@ def start_create(chat_id):
 
     send_message(
         chat_id,
-        "📝 Enter notification title:\n\n"
-        "Send /cancel to cancel."
+        "📝 Enter notification title:\n\nSend /cancel to cancel."
     )
 
 
@@ -284,7 +287,6 @@ def process_text(message):
     if step == "title":
         drafts[chat_id] = {"title": text}
         user_states[chat_id] = {"step": "message"}
-
         send_message(chat_id, "✉️ Enter notification message:")
 
     elif step == "message":
@@ -292,14 +294,11 @@ def process_text(message):
         user_states.pop(chat_id, None)
 
         draft = drafts[chat_id]
-
         keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "✅ Confirm & Send", "callback_data": "confirm_send"},
-                    {"text": "❌ Cancel", "callback_data": "cancel"}
-                ]
-            ]
+            "inline_keyboard": [[
+                {"text": "✅ Confirm & Send", "callback_data": "confirm_send"},
+                {"text": "❌ Cancel", "callback_data": "cancel"}
+            ]]
         }
 
         send_message(
@@ -314,7 +313,6 @@ def process_text(message):
     elif step == "edit_title":
         state["title"] = text
         state["step"] = "edit_message"
-
         send_message(chat_id, "✉️ Enter the new message:")
 
     elif step == "edit_message":
@@ -333,7 +331,6 @@ def process_text(message):
                 "✅ Notification history updated.",
                 main_keyboard()
             )
-
         except Exception:
             logging.exception("Edit error")
             send_message(chat_id, "❌ Could not update notification.")
@@ -348,10 +345,9 @@ def confirm_send(chat_id):
 
     title = draft["title"]
     message = draft["message"]
-
-    send_message(chat_id, "⏳ Saving notification and sending to users...")
-
     notification_id = None
+
+    send_message(chat_id, "⏳ Saving notification and sending...")
 
     try:
         record = save_notification(title, message, "sending")
@@ -384,14 +380,13 @@ def confirm_send(chat_id):
                     "error": str(error)[:1000]
                 })
             except Exception:
-                logging.exception("Could not update failed status")
+                logging.exception("Failed to update status")
 
         send_message(
             chat_id,
-            f"❌ Sending failed:\n{str(error)[:1500]}",
+            f"❌ Sending failed:\n{str(error)[:1200]}",
             main_keyboard()
         )
-
     finally:
         drafts.pop(chat_id, None)
 
@@ -407,31 +402,27 @@ def show_history(chat_id):
             return
 
         for item in records:
-            status = item.get("status", "unknown")
+            notification_id = item.get("id")
 
             text = (
                 f"📌 {item.get('title', '')}\n\n"
                 f"✉️ {item.get('message', '')}\n\n"
-                f"🆔 ID: {item.get('id')}\n"
-                f"📊 Status: {status}\n"
+                f"🆔 ID: {notification_id}\n"
+                f"📊 Status: {item.get('status', 'unknown')}\n"
                 f"🕒 Created: {item.get('created_at', '')}"
             )
 
-            notification_id = item.get("id")
-
             keyboard = {
-                "inline_keyboard": [
-                    [
-                        {
-                            "text": "✏️ Edit",
-                            "callback_data": f"edit:{notification_id}"
-                        },
-                        {
-                            "text": "🗑 Delete",
-                            "callback_data": f"delete:{notification_id}"
-                        }
-                    ]
-                ]
+                "inline_keyboard": [[
+                    {
+                        "text": "✏️ Edit",
+                        "callback_data": f"edit:{notification_id}"
+                    },
+                    {
+                        "text": "🗑 Delete",
+                        "callback_data": f"delete:{notification_id}"
+                    }
+                ]]
             }
 
             send_message(chat_id, text, keyboard)
@@ -449,9 +440,7 @@ def process_callback(callback):
     chat_id = callback["message"]["chat"]["id"]
     data = callback.get("data", "")
 
-    callback_id = callback["id"]
-
-    answer_callback(callback_id)
+    answer_callback(callback["id"])
 
     if data == "dashboard":
         show_dashboard(chat_id)
@@ -468,12 +457,7 @@ def process_callback(callback):
     elif data == "cancel":
         user_states.pop(chat_id, None)
         drafts.pop(chat_id, None)
-
-        send_message(
-            chat_id,
-            "❌ Operation cancelled.",
-            main_keyboard()
-        )
+        send_message(chat_id, "❌ Operation cancelled.", main_keyboard())
 
     elif data.startswith("edit:"):
         notification_id = data.split(":", 1)[1]
@@ -481,7 +465,10 @@ def process_callback(callback):
         try:
             records = supabase_request(
                 "GET",
-                params={"id": f"eq.{notification_id}", "select": "*"}
+                params={
+                    "id": f"eq.{notification_id}",
+                    "select": "*"
+                }
             )
 
             if not records:
@@ -511,23 +498,21 @@ def process_callback(callback):
         notification_id = data.split(":", 1)[1]
 
         keyboard = {
-            "inline_keyboard": [
-                [
-                    {
-                        "text": "✅ Yes, Delete",
-                        "callback_data": f"delete_confirm:{notification_id}"
-                    },
-                    {
-                        "text": "❌ Cancel",
-                        "callback_data": "cancel"
-                    }
-                ]
-            ]
+            "inline_keyboard": [[
+                {
+                    "text": "✅ Yes, Delete",
+                    "callback_data": f"delete_confirm:{notification_id}"
+                },
+                {
+                    "text": "❌ Cancel",
+                    "callback_data": "cancel"
+                }
+            ]]
         }
 
         send_message(
             chat_id,
-            f"⚠️ Delete notification ID {notification_id}?",
+            f"⚠️ Delete notification history ID {notification_id}?",
             keyboard
         )
 
@@ -536,13 +521,11 @@ def process_callback(callback):
 
         try:
             delete_notification(notification_id)
-
             send_message(
                 chat_id,
                 "🗑 Notification history deleted.",
                 main_keyboard()
             )
-
         except Exception:
             logging.exception("Delete error")
             send_message(chat_id, "❌ Could not delete notification.")
@@ -552,6 +535,7 @@ def process_callback(callback):
 
 def process_update(update):
     if not is_admin(update):
+        logging.warning("Ignored update from non-admin user")
         return
 
     if "callback_query" in update:
@@ -565,13 +549,12 @@ def process_update(update):
     chat_id = message["chat"]["id"]
     text = message.get("text", "")
 
-    if text == "/start" or text == "/menu":
+    if text.split("@")[0] in ("/start", "/menu"):
         user_states.pop(chat_id, None)
         drafts.pop(chat_id, None)
-
         show_dashboard(chat_id)
 
-    elif text == "/cancel":
+    elif text.split("@")[0] == "/cancel":
         user_states.pop(chat_id, None)
         drafts.pop(chat_id, None)
         send_message(chat_id, "❌ Cancelled.", main_keyboard())
@@ -583,74 +566,81 @@ def process_update(update):
         process_text(message)
 
 
-# ================= TELEGRAM POLLING =================
+# ================= WEBHOOK =================
 
-def telegram_polling():
-    offset = None
+@app.route("/telegram-webhook", methods=["POST"])
+def telegram_webhook():
+    if not WEBHOOK_SECRET:
+        return jsonify({"error": "Webhook secret is not configured"}), 503
 
-    telegram("deleteWebhook", {"drop_pending_updates": False})
-
-    logging.info("Telegram polling started")
-
-    while True:
-        try:
-            params = {
-                "timeout": 25,
-                "allowed_updates": ["message", "callback_query"]
-            }
-
-            if offset is not None:
-                params["offset"] = offset
-
-            response = requests.get(
-                f"{TELEGRAM_API}/getUpdates",
-                params=params,
-                timeout=35
-            )
-
-            result = response.json()
-
-            if not result.get("ok"):
-                logging.error("Polling error: %s", result)
-                time.sleep(5)
-                continue
-
-            for update in result.get("result", []):
-                offset = update["update_id"] + 1
-
-                try:
-                    process_update(update)
-                except Exception:
-                    logging.exception("Update processing error")
-
-        except Exception:
-            logging.exception("Telegram polling connection error")
-            time.sleep(5)
-
-
-def start_polling():
-    global polling_started
-
-    with polling_lock:
-        if polling_started:
-            return
-
-        polling_started = True
-
-    thread = threading.Thread(
-        target=telegram_polling,
-        daemon=True
+    supplied_secret = request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token", ""
     )
-    thread.start()
+
+    if supplied_secret != WEBHOOK_SECRET:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    update = request.get_json(silent=True)
+
+    if not isinstance(update, dict):
+        return jsonify({"ok": False, "error": "Invalid update"}), 400
+
+    update_id = update.get("update_id")
+
+    if update_id is not None:
+        with processed_lock:
+            if update_id in processed_updates:
+                return jsonify({"ok": True, "duplicate": True})
+
+            processed_updates.add(update_id)
+
+            # Keep the in-memory duplicate cache bounded.
+            if len(processed_updates) > 2000:
+                processed_updates.clear()
+                processed_updates.add(update_id)
+
+    try:
+        process_update(update)
+    except Exception:
+        logging.exception("Webhook update processing failed")
+
+        # Telegram can retry the update if it receives a non-2xx response.
+        return jsonify({"ok": False}), 500
+
+    return jsonify({"ok": True})
 
 
-# ================= FLASK =================
+# ================= REGISTER WEBHOOK =================
+
+def setup_webhook():
+    if not BOT_TOKEN or not WEBHOOK_URL or not WEBHOOK_SECRET:
+        logging.error(
+            "Missing TELEGRAM_BOT_TOKEN, WEBHOOK_URL or WEBHOOK_SECRET"
+        )
+        return
+
+    try:
+        result = telegram("setWebhook", {
+            "url": WEBHOOK_URL + "/telegram-webhook",
+            "secret_token": WEBHOOK_SECRET,
+            "allowed_updates": ["message", "callback_query"],
+            "drop_pending_updates": False
+        })
+
+        logging.info("Webhook registration result: %s", result)
+
+    except Exception:
+        logging.exception("Webhook registration failed")
+
+
+# ================= FLASK ROUTES =================
 
 @app.route("/")
 def home():
     return jsonify({
         "status": "live",
-        "service": "KMT FCM Notification Bot"
+        "service": "KMT FCM Notification Bot",
+        "mode": "webhook"
     })
 
 
@@ -659,8 +649,9 @@ def health():
     return jsonify({"status": "ok"})
 
 
-# Start polling when Gunicorn imports this module
-if BOT_TOKEN and ADMIN_ID:
-    start_polling()
+# Register webhook when Gunicorn imports this module.
+# Use one Gunicorn worker so process-local state is shared.
+if BOT_TOKEN and WEBHOOK_URL and WEBHOOK_SECRET:
+    setup_webhook()
 else:
-    logging.error("Telegram bot environment variables are missing")
+    logging.error("Webhook environment variables are missing")
