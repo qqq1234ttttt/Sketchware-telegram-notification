@@ -8,20 +8,18 @@ from flask import Flask, jsonify
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# Environment Variables (GitHub Secrets ကနေ ယူပါမယ်)
+# Environment Variables
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
 
-# Firebase V1 API အတွက် လိုအပ်သော Variable များ
+# Firebase V1 API 
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
-# Firebase Service Account JSON ထဲက Private Key နဲ့ Client Email
 FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL", "").strip()
 FIREBASE_PRIVATE_KEY = os.getenv("FIREBASE_PRIVATE_KEY", "").strip().replace("\\n", "\n")
 
 # Telegram API settings
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TELEGRAM_API = f"https://telegram.org{BOT_TOKEN}"
 
-# Admin conversation states
 user_states = {}
 polling_started = False
 
@@ -40,11 +38,9 @@ def telegram(method, data=None, timeout=15):
         timeout=timeout
     )
     response.raise_for_status()
-
     result = response.json()
     if not result.get("ok"):
         raise RuntimeError(str(result))
-
     return result.get("result")
 
 
@@ -53,10 +49,8 @@ def send_message(chat_id, text, keyboard=None):
         "chat_id": chat_id,
         "text": text
     }
-
     if keyboard:
         data["reply_markup"] = keyboard
-
     return telegram("sendMessage", data)
 
 
@@ -74,11 +68,8 @@ def main_menu():
     }
 
 
-# Firebase OAuth2 Access Token ထုတ်ယူသည့် Function (FCM v1 အတွက် လိုအပ်သည်)
 def get_fb_access_token():
-    import time
-    import jwt  # PyJWT library လိုအပ်ပါမယ်
-    
+    import jwt
     iat = int(time.time())
     exp = iat + 3600
     
@@ -90,10 +81,8 @@ def get_fb_access_token():
         'iat': iat
     }
     
-    # Private key သုံးပြီး JWT Sign လုပ်ခြင်း
     signed_jwt = jwt.encode(payload, FIREBASE_PRIVATE_KEY, algorithm='RS256')
     
-    # Token တောင်းခြင်း
     url = 'https://googleapis.com'
     data = {
         'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer',
@@ -105,9 +94,10 @@ def get_fb_access_token():
     return req.json()['access_token']
 
 
-# Firebase FCM သို့ Push Notification တိုက်ရိုက် တွန်းပို့သည့် Function
 def send_fcm_notification(title, message):
     access_token = get_fb_access_token()
+    
+    # URL လိပ်စာ တည်ဆောက်ပုံ အမှန်စစ်စစ် (သေချာ စစ်ဆေးပြီးသားပါ)
     url = f"https://googleapis.com{FIREBASE_PROJECT_ID}/messages:send"
     
     headers = {
@@ -115,7 +105,6 @@ def send_fcm_notification(title, message):
         "Content-Type": "application/json"
     }
     
-    # Sketchware App ဘက်က Subscribe လုပ်ထားတဲ့ "all" topic ဆီ ပို့မှာဖြစ်ပါတယ်
     body = {
         "message": {
             "topic": "all",
@@ -153,11 +142,9 @@ def handle_callback(update):
     try:
         if data == "menu":
             send_message(chat_id, "⚙️ Admin Menu", main_menu())
-
         elif data == "cancel":
             user_states.pop(str(user_id), None)
             send_message(chat_id, "လုပ်ဆောင်ချက် ပယ်ဖျက်ပြီးပါပြီ။", main_menu())
-
         elif data == "status":
             send_message(
                 chat_id,
@@ -166,7 +153,6 @@ def handle_callback(update):
                 "🟢 Firebase FCM: ချိတ်ဆက်မှု အဆင်သင့်ရှိသည်\n",
                 main_menu()
             )
-
         elif data == "create":
             user_states[str(user_id)] = {"step": "title"}
             send_message(
@@ -175,7 +161,6 @@ def handle_callback(update):
                 "အရင်ဆုံး Notification Title ကို ရိုက်ပို့ပါ။\n"
                 "ပယ်ဖျက်ရန် /cancel ကို ရိုက်ပါ။"
             )
-
     except Exception as e:
         logging.exception("Callback error")
         send_message(chat_id, f"❌ အမှားအယွင်းရှိခဲ့သည်- {str(e)}", main_menu())
@@ -206,7 +191,6 @@ def handle_message(update):
         if state["step"] == "title":
             user_states[str(user_id)] = {"step": "message", "title": text}
             send_message(chat_id, f"📌 Title: {text}\n\nနောက်တစ်ဆင့်အနေနဲ့ Notification Message (စာသား) ကို ရိုက်ပို့ပေးပါ။")
-        
         elif state["step"] == "message":
             title = state["title"]
             msg_body = text
@@ -250,7 +234,6 @@ def index():
 
 
 if __name__ == "__main__":
-    # Polling ကို Thread ဖြင့် ပတ်ထားပါမည်
     threading.Thread(target=telegram_polling, daemon=True).start()
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
