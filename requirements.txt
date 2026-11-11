@@ -1,5 +1,4 @@
 Flask
 requests
-PyJWT
-cryptography
+firebase-admin
 gunicorn
