@@ -143,9 +143,17 @@ def send_fcm_notification(title, body):
             title=title,
             body=body
         ),
+        android=messaging.AndroidConfig(
+            priority="high",
+            notification=messaging.AndroidNotification(
+                channel_id="fcm_default_channel",
+                sound="default"
+            )
+        ),
         topic="all"
     )
     return messaging.send(message)
+
 
 
 # ================ SUPABASE ================
