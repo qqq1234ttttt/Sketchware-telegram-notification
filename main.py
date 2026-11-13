@@ -406,15 +406,14 @@ def set_device_offline(device_id):
 
 def background_offline_checker():
     """
-    Background Thread: စက္ကန့် ၃၀ တစ်ကြိမ် စစ်ဆေးမည်။
-    အကယ်၍ Device တစ်ခု၏ last_seen သည် စက္ကန့် ၆၀ ကျော်လွန် تر (Ping မလာတော့ပါက) 
+    Background Thread: ၅ စက္ကန့် တစ်ကြိမ် စစ်ဆေးမည်။
+    အကယ်၍ Device တစ်ခု၏ last_seen သည် ၁၀ စက္ကန့် ကျော်လွန် تر (Ping မလာတော့ပါက) 
     ထို Device ကို အလိုအလျောက် Offline သတ်မှတ်မည်။
     """
     while True:
         try:
-            time.sleep(30)
+            time.sleep(5)  # ၅ စက္ကန့် တစ်ကြိမ် စစ်ဆေးမည်
             
-            # online_users စာရင်းအားလုံးကို ဆွဲထုတ်မည်
             online_devices = supabase_request(
                 "GET",
                 ONLINE_USERS_TABLE,
@@ -434,14 +433,11 @@ def background_offline_checker():
                     continue
 
                 try:
-                    # ISO format string ကို datetime object သို့ ပြောင်းခြင်း
                     last_seen_time = datetime.fromisoformat(last_seen_str.replace("Z", "+00:00"))
-                    
-                    # လက်ရှိအချိန်နှင့် last_seen အကြား ကွာဟချက်ကို တွက်ချက်ခြင်း (စက္ကန့်ဖြင့်)
                     diff_seconds = (now_utc - last_seen_time).total_seconds()
 
-                    # အကယ်၍ စက္ကန့် ၆၀ (1 မိနစ်) ကျော် تر Ping မလာတော့ပါက Offline ပြောင်းမည်
-                    if diff_seconds > 60:
+                    # ၁၀ စက္ကန့် ကျော် تر Ping မလာတော့ပါက ချက်ချင်း Offline ပြောင်းမည်
+                    if diff_seconds > 10:
                         logging.warning("Device timeout detected (No ping for %s seconds). Marking offline: %s", int(diff_seconds), device_id)
                         set_device_offline(device_id)
 
@@ -452,7 +448,6 @@ def background_offline_checker():
             logging.exception("Background offline checker error: %s", e)
 
 
-# Background Thread ကို စတင်ခြင်း
 def start_offline_checker_thread():
     t = threading.Thread(target=background_offline_checker, daemon=True)
     t.start()
