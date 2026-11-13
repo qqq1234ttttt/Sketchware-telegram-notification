@@ -1,4 +1,3 @@
-
 import os
 import hmac
 import logging
@@ -7,7 +6,7 @@ from datetime import datetime, timezone
 
 import requests
 import firebase_admin
-from firebase_admin import credentials, messaging, db
+from firebase_admin import credentials, messaging
 from flask import Flask, jsonify, request, abort
 
 # ================ CONFIG ================
@@ -21,6 +20,9 @@ SUPABASE_TABLE_NAME = os.getenv(
     "SUPABASE_TABLE_NAME", "notifications"
 ).strip()
 
+# Shared key used by Android -> Render API
+DEVICE_API_KEY = os.getenv("DEVICE_API_KEY", "").strip()
+
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
 FIREBASE_CLIENT_EMAIL = os.getenv(
     "FIREBASE_CLIENT_EMAIL", ""
@@ -28,11 +30,6 @@ FIREBASE_CLIENT_EMAIL = os.getenv(
 FIREBASE_PRIVATE_KEY = os.getenv(
     "FIREBASE_PRIVATE_KEY", ""
 ).replace("\\n", "\n").strip()
-
-FIREBASE_DB_URL = os.getenv(
-    "FIREBASE_DB_URL",
-    "https://kmt-all-software-bc807-default-rtdb.asia-southeast1.firebasedatabase.app"
-).rstrip("/")
 
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
@@ -47,6 +44,16 @@ SUPABASE_TABLE = (
     if SUPABASE_URL else ""
 )
 
+ALL_DEVICES_TABLE = (
+    f"{SUPABASE_URL}/rest/v1/all_devices"
+    if SUPABASE_URL else ""
+)
+
+ONLINE_USERS_TABLE = (
+    f"{SUPABASE_URL}/rest/v1/online_users"
+    if SUPABASE_URL else ""
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
@@ -58,10 +65,15 @@ user_states = {}
 drafts = {}
 state_lock = threading.RLock()
 
-# Prevent repeated processing of recently received Telegram updates.
 processed_updates = set()
 processed_lock = threading.Lock()
 MAX_PROCESSED_UPDATES = 5000
+
+
+# ================ TIME ================
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ================ TELEGRAM API ================
@@ -79,18 +91,12 @@ def telegram(method, data=None):
     try:
         result = response.json()
     except ValueError:
-        logging.error(
-            "Telegram returned invalid JSON, HTTP %s",
-            response.status_code
-        )
         response.raise_for_status()
         raise RuntimeError("Invalid Telegram API response")
 
     if not response.ok or not result.get("ok"):
         code = result.get("error_code", response.status_code)
-        description = result.get(
-            "description", "Unknown Telegram error"
-        )
+        description = result.get("description", "Unknown Telegram error")
         logging.error(
             "Telegram API %s failed: %s: %s",
             method, code, description
@@ -122,7 +128,7 @@ def answer_callback(callback_id, text=""):
         logging.exception("Callback answer failed")
 
 
-# ================ FIREBASE ================
+# ================ FIREBASE FCM ONLY ================
 
 def init_firebase():
     if firebase_admin._apps:
@@ -134,7 +140,7 @@ def init_firebase():
         "FIREBASE_PRIVATE_KEY": FIREBASE_PRIVATE_KEY
     }
 
-    missing = [key for key, value in required.items() if not value]
+    missing = [k for k, v in required.items() if not v]
     if missing:
         raise RuntimeError(
             "Missing Firebase environment variables: "
@@ -150,34 +156,8 @@ def init_firebase():
     }
 
     firebase_admin.initialize_app(
-        credentials.Certificate(service_account),
-        {"databaseURL": FIREBASE_DB_URL}
+        credentials.Certificate(service_account)
     )
-
-
-def get_device_stats():
-    try:
-        init_firebase()
-
-        online_data = db.reference("online_users").get()
-        total_data = db.reference("all_devices").get()
-
-        online_count = (
-            len(online_data)
-            if isinstance(online_data, (dict, list))
-            else 0
-        )
-        total_count = (
-            len(total_data)
-            if isinstance(total_data, (dict, list))
-            else 0
-        )
-
-        return online_count, total_count
-
-    except Exception:
-        logging.exception("Firebase device stats failed")
-        return 0, 0
 
 
 def send_fcm_notification(title, body):
@@ -203,7 +183,7 @@ def send_fcm_notification(title, body):
 
 # ================ SUPABASE ================
 
-def supabase_headers():
+def supabase_headers(prefer="return=representation"):
     if not SUPABASE_KEY:
         raise RuntimeError("SUPABASE_KEY is missing")
 
@@ -211,11 +191,12 @@ def supabase_headers():
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
-        "Prefer": "return=representation"
+        "Prefer": prefer
     }
 
 
-def supabase_request(method, params=None, data=None):
+def supabase_request(method, table_url, params=None, data=None,
+                     prefer="return=representation"):
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError(
             "SUPABASE_URL or SUPABASE_KEY is missing"
@@ -223,19 +204,19 @@ def supabase_request(method, params=None, data=None):
 
     response = requests.request(
         method,
-        SUPABASE_TABLE,
-        headers=supabase_headers(),
+        table_url,
+        headers=supabase_headers(prefer),
         params=params,
         json=data,
         timeout=20
     )
 
     if not response.ok:
-        # Avoid logging request headers or secret keys.
+        # Do not log credentials or authorization headers.
         logging.error(
-            "Supabase request failed: HTTP %s; response=%s",
+            "Supabase request failed: HTTP %s; body=%s",
             response.status_code,
-            response.text[:1000]
+            response.text[:500]
         )
         response.raise_for_status()
 
@@ -245,8 +226,17 @@ def supabase_request(method, params=None, data=None):
     return []
 
 
+def notification_request(method, params=None, data=None):
+    return supabase_request(
+        method,
+        SUPABASE_TABLE,
+        params=params,
+        data=data
+    )
+
+
 def save_notification(title, body, status="sending"):
-    rows = supabase_request(
+    rows = notification_request(
         "POST",
         data={
             "title": title,
@@ -257,7 +247,7 @@ def save_notification(title, body, status="sending"):
 
     if not rows:
         raise RuntimeError(
-            "Supabase did not return the inserted record"
+            "Supabase did not return the inserted notification"
         )
 
     return rows[0]
@@ -265,11 +255,9 @@ def save_notification(title, body, status="sending"):
 
 def update_notification(notification_id, values):
     payload = dict(values)
-    payload["updated_at"] = datetime.now(
-        timezone.utc
-    ).isoformat()
+    payload["updated_at"] = now_iso()
 
-    return supabase_request(
+    return notification_request(
         "PATCH",
         params={"id": f"eq.{notification_id}"},
         data=payload
@@ -277,7 +265,7 @@ def update_notification(notification_id, values):
 
 
 def get_notifications(limit=10):
-    return supabase_request(
+    return notification_request(
         "GET",
         params={
             "select": "*",
@@ -288,7 +276,7 @@ def get_notifications(limit=10):
 
 
 def get_notification(notification_id):
-    rows = supabase_request(
+    rows = notification_request(
         "GET",
         params={
             "id": f"eq.{notification_id}",
@@ -300,10 +288,177 @@ def get_notification(notification_id):
 
 
 def delete_notification(notification_id):
-    return supabase_request(
+    return notification_request(
         "DELETE",
         params={"id": f"eq.{notification_id}"}
     )
+
+
+# ================ DEVICE STATUS IN SUPABASE ================
+
+def get_device_stats():
+    online_rows = supabase_request(
+        "GET",
+        ONLINE_USERS_TABLE,
+        params={
+            "select": "device_id",
+            "limit": "10000"
+        }
+    )
+
+    total_rows = supabase_request(
+        "GET",
+        ALL_DEVICES_TABLE,
+        params={
+            "select": "device_id",
+            "limit": "10000"
+        }
+    )
+
+    return len(online_rows), len(total_rows)
+
+
+def upsert_device(device_id, model="", manufacturer=""):
+    timestamp = now_iso()
+
+    device_data = {
+        "device_id": device_id,
+        "device": "Android",
+        "model": model,
+        "manufacturer": manufacturer,
+        "status": "online",
+        "last_seen": timestamp,
+        "updated_at": timestamp
+    }
+
+    # Register/update the device record.
+    supabase_request(
+        "POST",
+        ALL_DEVICES_TABLE,
+        params={"on_conflict": "device_id"},
+        data=device_data,
+        prefer="resolution=merge-duplicates,return=representation"
+    )
+
+    # Insert/update the online record.
+    online_data = {
+        "device_id": device_id,
+        "status": "online",
+        "last_seen": timestamp
+    }
+
+    supabase_request(
+        "POST",
+        ONLINE_USERS_TABLE,
+        params={"on_conflict": "device_id"},
+        data=online_data,
+        prefer="resolution=merge-duplicates,return=representation"
+    )
+
+
+def set_device_offline(device_id):
+    timestamp = now_iso()
+
+    # Remove the device from the online list.
+    supabase_request(
+        "DELETE",
+        ONLINE_USERS_TABLE,
+        params={"device_id": f"eq.{device_id}"}
+    )
+
+    # Keep its registration record, but mark it offline.
+    supabase_request(
+        "PATCH",
+        ALL_DEVICES_TABLE,
+        params={"device_id": f"eq.{device_id}"},
+        data={
+            "status": "offline",
+            "last_seen": timestamp,
+            "updated_at": timestamp
+        }
+    )
+
+
+# ================ DEVICE API SECURITY ================
+
+def verify_device_api_key():
+    if not DEVICE_API_KEY:
+        logging.error("DEVICE_API_KEY is not configured")
+        abort(503, description="Device API is not configured")
+
+    supplied = request.headers.get("X-Device-API-Key", "")
+
+    if not hmac.compare_digest(supplied, DEVICE_API_KEY):
+        abort(401, description="Unauthorized")
+
+
+def validate_device_payload():
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        abort(400, description="JSON object required")
+
+    device_id = str(data.get("device_id", "")).strip()
+
+    if not device_id or len(device_id) > 128:
+        abort(400, description="Invalid device_id")
+
+    model = str(data.get("model", "Unknown")).strip()[:200]
+    manufacturer = str(
+        data.get("manufacturer", "Unknown")
+    ).strip()[:200]
+
+    return device_id, model, manufacturer
+
+
+@app.route("/api/device/online", methods=["POST"])
+def device_online():
+    verify_device_api_key()
+
+    device_id, model, manufacturer = validate_device_payload()
+
+    try:
+        upsert_device(device_id, model, manufacturer)
+        return jsonify({
+            "ok": True,
+            "device_id": device_id,
+            "status": "online"
+        })
+    except Exception:
+        logging.exception("Device online update failed")
+        return jsonify({
+            "ok": False,
+            "error": "Could not update device status"
+        }), 500
+
+
+@app.route("/api/device/offline", methods=["POST"])
+def device_offline():
+    verify_device_api_key()
+
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        abort(400, description="JSON object required")
+
+    device_id = str(data.get("device_id", "")).strip()
+
+    if not device_id or len(device_id) > 128:
+        abort(400, description="Invalid device_id")
+
+    try:
+        set_device_offline(device_id)
+        return jsonify({
+            "ok": True,
+            "device_id": device_id,
+            "status": "offline"
+        })
+    except Exception:
+        logging.exception("Device offline update failed")
+        return jsonify({
+            "ok": False,
+            "error": "Could not update device status"
+        }), 500
 
 
 # ================ ACCESS CONTROL ================
@@ -711,10 +866,7 @@ def process_callback(callback):
 
         except Exception:
             logging.exception("Edit lookup failed")
-            send_message(
-                chat_id,
-                "❌ Could not load notification."
-            )
+            send_message(chat_id, "❌ Could not load notification.")
 
     elif data.startswith("delete_confirm:"):
         notification_id = data.split(":", 1)[1]
@@ -797,11 +949,7 @@ def process_update(update):
             user_states.pop(chat_id, None)
             drafts.pop(chat_id, None)
 
-        send_message(
-            chat_id,
-            "❌ Cancelled.",
-            main_keyboard()
-        )
+        send_message(chat_id, "❌ Cancelled.", main_keyboard())
 
     else:
         process_text(message)
@@ -811,33 +959,22 @@ def process_update(update):
 
 def setup_webhook():
     if not BOT_TOKEN:
-        logging.error(
-            "Webhook not configured: TELEGRAM_BOT_TOKEN is missing"
-        )
+        logging.error("TELEGRAM_BOT_TOKEN is missing")
         return False
 
     if not WEBHOOK_URL:
-        logging.error(
-            "Webhook not configured: WEBHOOK_URL is missing"
-        )
+        logging.error("WEBHOOK_URL is missing")
         return False
 
     if WEBHOOK_SECRET and not (
         1 <= len(WEBHOOK_SECRET) <= 256
-        and all(
-            c.isalnum() or c in "_-"
-            for c in WEBHOOK_SECRET
-        )
+        and all(c.isalnum() or c in "_-" for c in WEBHOOK_SECRET)
     ):
-        logging.error(
-            "WEBHOOK_SECRET must contain only letters, numbers, _ or -"
-        )
+        logging.error("Invalid WEBHOOK_SECRET format")
         return False
 
-    webhook = f"{WEBHOOK_URL}/telegram-webhook"
-
     payload = {
-        "url": webhook,
+        "url": f"{WEBHOOK_URL}/telegram-webhook",
         "allowed_updates": ["message", "callback_query"],
         "drop_pending_updates": False
     }
@@ -847,21 +984,18 @@ def setup_webhook():
 
     try:
         result = telegram("setWebhook", payload)
-
         logging.info(
-            "Webhook registration successful: %s",
+            "Webhook registration: %s",
             result.get("description", "OK")
         )
 
         info = telegram("getWebhookInfo").get("result", {})
-
         logging.info(
             "Webhook info: url=%s, pending=%s, last_error=%s",
             info.get("url", ""),
             info.get("pending_update_count", 0),
             info.get("last_error_message", "")
         )
-
         return True
 
     except Exception:
@@ -876,7 +1010,8 @@ def home():
     return jsonify({
         "status": "live",
         "service": "KMT FCM Notification Bot",
-        "mode": "webhook"
+        "mode": "webhook",
+        "device_api": True
     })
 
 
@@ -892,9 +1027,7 @@ def telegram_webhook():
             "X-Telegram-Bot-Api-Secret-Token", ""
         )
 
-        if not hmac.compare_digest(
-            supplied_secret, WEBHOOK_SECRET
-        ):
+        if not hmac.compare_digest(supplied_secret, WEBHOOK_SECRET):
             abort(403)
 
     update = request.get_json(silent=True)
@@ -925,7 +1058,6 @@ def telegram_webhook():
     except Exception:
         logging.exception("Failed to process Telegram update")
 
-        # Remove the ID so Telegram can retry this update.
         if update_id is not None:
             with processed_lock:
                 processed_updates.discard(update_id)
@@ -936,7 +1068,7 @@ def telegram_webhook():
         }), 500
 
 
-# Register the webhook when Gunicorn imports this module.
+# Register webhook when Gunicorn imports this module.
 setup_webhook()
 
 
