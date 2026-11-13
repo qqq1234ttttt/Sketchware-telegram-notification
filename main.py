@@ -1,9 +1,9 @@
-
 import os
 import hmac
 import logging
 import threading
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timezone, timedelta
 
 import requests
 import firebase_admin
@@ -21,8 +21,6 @@ SUPABASE_TABLE_NAME = os.getenv(
     "SUPABASE_TABLE_NAME", "notifications"
 ).strip()
 
-# Set this value in Render Environment Variables.
-# Do not hardcode the key in this Python file.
 DEVICE_API_KEY = os.getenv("DEVICE_API_KEY", "").strip()
 
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
@@ -235,7 +233,6 @@ def supabase_request(
     )
 
     if not response.ok:
-        # Log response body to help diagnose table/schema problems.
         logging.error(
             "Supabase request failed: method=%s HTTP=%s body=%s",
             method,
@@ -358,7 +355,6 @@ def upsert_device(device_id, model="", manufacturer=""):
         "updated_at": timestamp,
     }
 
-    # Register or update the device in all_devices.
     supabase_request(
         "POST",
         ALL_DEVICES_TABLE,
@@ -373,7 +369,6 @@ def upsert_device(device_id, model="", manufacturer=""):
         "last_seen": timestamp
     }
 
-    # Add or update the current online device.
     supabase_request(
         "POST",
         ONLINE_USERS_TABLE,
@@ -388,14 +383,12 @@ def upsert_device(device_id, model="", manufacturer=""):
 def set_device_offline(device_id):
     timestamp = now_iso()
 
-    # Remove from the current online list.
     supabase_request(
         "DELETE",
         ONLINE_USERS_TABLE,
         params={"device_id": f"eq.{device_id}"}
     )
 
-    # Preserve registration in all_devices.
     supabase_request(
         "PATCH",
         ALL_DEVICES_TABLE,
@@ -407,6 +400,63 @@ def set_device_offline(device_id):
     )
 
     logging.info("Device marked offline: %s", device_id)
+
+
+# ================ BACKGROUND TIMEOUT CHECKER ================
+
+def background_offline_checker():
+    """
+    Background Thread: စက္ကန့် ၃၀ တစ်ကြိမ် စစ်ဆေးမည်။
+    အကယ်၍ Device တစ်ခု၏ last_seen သည် စက္ကန့် ၆၀ ကျော်လွန် تر (Ping မလာတော့ပါက) 
+    ထို Device ကို အလိုအလျောက် Offline သတ်မှတ်မည်။
+    """
+    while True:
+        try:
+            time.sleep(30)
+            
+            # online_users စာရင်းအားလုံးကို ဆွဲထုတ်မည်
+            online_devices = supabase_request(
+                "GET",
+                ONLINE_USERS_TABLE,
+                params={"select": "device_id,last_seen", "limit": "1000"}
+            )
+
+            if not online_devices:
+                continue
+
+            now_utc = datetime.now(timezone.utc)
+
+            for dev in online_devices:
+                device_id = dev.get("device_id")
+                last_seen_str = dev.get("last_seen")
+
+                if not device_id or not last_seen_str:
+                    continue
+
+                try:
+                    # ISO format string ကို datetime object သို့ ပြောင်းခြင်း
+                    last_seen_time = datetime.fromisoformat(last_seen_str.replace("Z", "+00:00"))
+                    
+                    # လက်ရှိအချိန်နှင့် last_seen အကြား ကွာဟချက်ကို တွက်ချက်ခြင်း (စက္ကန့်ဖြင့်)
+                    diff_seconds = (now_utc - last_seen_time).total_seconds()
+
+                    # အကယ်၍ စက္ကန့် ၆၀ (1 မိနစ်) ကျော် تر Ping မလာတော့ပါက Offline ပြောင်းမည်
+                    if diff_seconds > 60:
+                        logging.warning("Device timeout detected (No ping for %s seconds). Marking offline: %s", int(diff_seconds), device_id)
+                        set_device_offline(device_id)
+
+                except Exception as parse_err:
+                    logging.error("Error parsing last_seen for device %s: %s", device_id, parse_err)
+
+        except Exception as e:
+            logging.exception("Background offline checker error: %s", e)
+
+
+# Background Thread ကို စတင်ခြင်း
+def start_offline_checker_thread():
+    t = threading.Thread(target=background_offline_checker, daemon=True)
+    t.start()
+    logging.info("Background offline checker thread started.")
 
 
 # ================ DEVICE API SECURITY ================
@@ -1226,6 +1276,9 @@ def telegram_webhook():
 
 # Register webhook when Gunicorn imports this module.
 setup_webhook()
+
+# Start the automatic offline timeout checker thread
+start_offline_checker_thread()
 
 
 if __name__ == "__main__":
