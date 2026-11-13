@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 
 import requests
 import firebase_admin
-from firebase_admin import credentials, messaging
+from firebase_admin import credentials, messaging, db
 from flask import Flask, jsonify, request
 
 # ================ CONFIG ================
@@ -22,12 +22,16 @@ FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL", "")
 FIREBASE_PRIVATE_KEY = os.getenv(
     "FIREBASE_PRIVATE_KEY", ""
 ).replace("\\n", "\n")
+FIREBASE_DB_URL = os.getenv(
+    "FIREBASE_DB_URL",
+    "https://kmt-all-software-bc807-default-rtdb.asia-southeast1.firebasedatabase.app"
+).rstrip("/")
 
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
 TELEGRAM_API = (
-    f"https://api.telegram.org/bot{BOT_TOKEN}"
+    f"https://telegram.org{BOT_TOKEN}"
     if BOT_TOKEN else ""
 )
 SUPABASE_TABLE = f"{SUPABASE_URL}/rest/v1/notifications"
@@ -45,6 +49,7 @@ drafts = {}
 processed_updates = set()
 processed_lock = threading.Lock()
 state_lock = threading.Lock()
+
 
 # ================ TELEGRAM API ================
 
@@ -105,7 +110,7 @@ def answer_callback(callback_id, text=""):
         logging.exception("Callback answer failed")
 
 
-# ================ FIREBASE FCM ================
+# ================ FIREBASE FCM & DATABASE ================
 
 def init_firebase():
     if firebase_admin._apps:
@@ -127,12 +132,27 @@ def init_firebase():
         "project_id": FIREBASE_PROJECT_ID,
         "private_key": FIREBASE_PRIVATE_KEY,
         "client_email": FIREBASE_CLIENT_EMAIL,
-        "token_uri": "https://oauth2.googleapis.com/token"
+        "token_uri": "https://googleapis.com"
     }
 
     firebase_admin.initialize_app(
-        credentials.Certificate(service_account)
+        credentials.Certificate(service_account),
+        {"databaseURL": FIREBASE_DB_URL}
     )
+
+
+def get_device_stats():
+    try:
+        init_firebase()
+        online_data = db.reference("online_users").get()
+        total_data = db.reference("all_devices").get()
+
+        online_count = len(online_data) if isinstance(online_data, dict) else 0
+        total_count = len(total_data) if isinstance(total_data, dict) else 0
+        return online_count, total_count
+    except Exception:
+        logging.exception("Failed to fetch Firebase device stats")
+        return 0, 0
 
 
 def send_fcm_notification(title, body):
@@ -153,7 +173,6 @@ def send_fcm_notification(title, body):
         topic="all"
     )
     return messaging.send(message)
-
 
 
 # ================ SUPABASE ================
@@ -294,8 +313,13 @@ def show_dashboard(chat_id):
             1 for item in records if item.get("status") == "sending"
         )
 
+        online_count, total_count = get_device_stats()
+
         text = (
             "📊 NOTIFICATION DASHBOARD\n\n"
+            f"🟢 Online Devices: {online_count}\n"
+            f"📱 Total Devices: {total_count}\n"
+            "────────────────────\n"
             f"📦 Latest records: {len(records)}\n"
             f"✅ Sent: {sent}\n"
             f"❌ Failed: {failed}\n"
@@ -307,9 +331,7 @@ def show_dashboard(chat_id):
         text = "⚠️ Could not load dashboard. Check Render Logs."
 
     send_message(chat_id, text, main_keyboard())
-
-
-# ================ CREATE NOTIFICATION ================
+    # ================ CREATE NOTIFICATION ================
 
 def start_create(chat_id):
     with state_lock:
@@ -662,152 +684,50 @@ def process_update(update):
             user_states.pop(chat_id, None)
             drafts.pop(chat_id, None)
         send_message(chat_id, "❌ Cancelled.", main_keyboard())
+)
+return
+webhook = WEBHOOK_URL + "/telegram-webhook"
+try:
+result = telegram("setWebhook", {
+"url": webhook,
+"secret_token": WEBHOOK_SECRET,
+"allowed_updates": ["message", "callback_query"],
+"drop_pending_updates": False
+})
+logging.info(
+"Webhook registration successful: %s",
+result.get("description", "OK")
+)
+info = telegram("getWebhookInfo").get("result", {})
+logging.info(
+"Webhook info: url=%s, pending=%s, last_error=%s",
+info.get("url", ""),
+info.get("pending_update_count", 0),
+info.get("last_error_message", "")
+)
+except Exception as error:
+# Do not crash the Flask app solely because registration failed.
+logging.error("Webhook registration failed: %s", error)
 
-    elif text.startswith("/"):
-        send_message(chat_id, "Use /start to open dashboard.")
-
-    else:
-        process_text(message)
-
-
-# ================ WEBHOOK ENDPOINT ================
-
-@app.route("/telegram-webhook", methods=["POST"])
-def telegram_webhook():
-    if not WEBHOOK_SECRET:
-        return jsonify({
-            "ok": False,
-            "error": "Webhook secret is not configured"
-        }), 503
-
-    supplied_secret = request.headers.get(
-        "X-Telegram-Bot-Api-Secret-Token", ""
-    )
-
-    if supplied_secret != WEBHOOK_SECRET:
-        logging.warning("Webhook rejected: secret mismatch")
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
-
-    update = request.get_json(silent=True)
-
-    if not isinstance(update, dict):
-        return jsonify({
-            "ok": False,
-            "error": "Invalid JSON update"
-        }), 400
-
-    update_id = update.get("update_id")
-
-    # This cache is best-effort only; it is not persistent across restarts.
-    if update_id is not None:
-        with processed_lock:
-            if update_id in processed_updates:
-                return jsonify({"ok": True, "duplicate": True})
-
-            processed_updates.add(update_id)
-
-            if len(processed_updates) > 5000:
-                processed_updates.clear()
-                processed_updates.add(update_id)
-
-    try:
-        process_update(update)
-    except Exception:
-        logging.exception("Webhook update processing failed")
-        if update_id is not None:
-            with processed_lock:
-                processed_updates.discard(update_id)
-        return jsonify({"ok": False}), 500
-
-    return jsonify({"ok": True})
-
-
-# ================ WEBHOOK REGISTRATION ================
-
-def setup_webhook():
-    if not BOT_TOKEN:
-        logging.error("TELEGRAM_BOT_TOKEN is missing")
-        return
-
-    if not WEBHOOK_URL or not WEBHOOK_SECRET:
-        logging.error("WEBHOOK_URL or WEBHOOK_SECRET is missing")
-        return
-
-    parsed = urlparse(WEBHOOK_URL)
-
-    if (
-        parsed.scheme != "https"
-        or not parsed.netloc
-        or parsed.path not in ("", "/")
-        or parsed.query
-        or parsed.fragment
-    ):
-        logging.error(
-            "Invalid WEBHOOK_URL. Use the base HTTPS Render URL only."
-        )
-        return
-
-    valid_secret = (
-        1 <= len(WEBHOOK_SECRET) <= 256
-        and all(
-            c.isascii() and (c.isalnum() or c in "_-")
-            for c in WEBHOOK_SECRET
-        )
-    )
-
-    if not valid_secret:
-        logging.error(
-            "Invalid WEBHOOK_SECRET: use only letters, numbers, _ and -"
-        )
-        return
-
-    webhook = WEBHOOK_URL + "/telegram-webhook"
-
-    try:
-        result = telegram("setWebhook", {
-            "url": webhook,
-            "secret_token": WEBHOOK_SECRET,
-            "allowed_updates": ["message", "callback_query"],
-            "drop_pending_updates": False
-        })
-
-        logging.info(
-            "Webhook registration successful: %s",
-            result.get("description", "OK")
-        )
-
-        info = telegram("getWebhookInfo").get("result", {})
-        logging.info(
-            "Webhook info: url=%s, pending=%s, last_error=%s",
-            info.get("url", ""),
-            info.get("pending_update_count", 0),
-            info.get("last_error_message", "")
-        )
-
-    except Exception as error:
-        # Do not crash the Flask app solely because registration failed.
-        logging.error("Webhook registration failed: %s", error)
-
-
-# ================ HEALTH ROUTES ================
+================ HEALTH ROUTES ================
 
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({
-        "status": "live",
-        "service": "KMT FCM Notification Bot",
-        "mode": "webhook"
-    })
-
-
+return jsonify({
+"status": "live",
+"service": "KMT FCM Notification Bot",
+"mode": "webhook"
+})
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+return jsonify({"status": "ok"})
 
+Register when Gunicorn imports main.py.
 
-# Register when Gunicorn imports main.py.
-if __name__ == "__main__":
-    setup_webhook()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+if name == "main":
+setup_webhook()
+app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
 else:
-    setup_webhook()
+setup_webhook()
+
+    
